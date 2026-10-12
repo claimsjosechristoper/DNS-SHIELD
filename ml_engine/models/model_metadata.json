@@ -1,0 +1,20 @@
+{
+  "model_type": "IsolationForest",
+  "n_estimators": 100,
+  "contamination": 0.05,
+  "sample_count": 1200,
+  "feature_columns": [
+    "shannon_entropy",
+    "domain_length",
+    "subdomain_length",
+    "label_count",
+    "query_frequency",
+    "unique_subdomain_rate",
+    "TXT_request_rate",
+    "NXDOMAIN_rate",
+    "average_packet_size"
+  ],
+  "trained_at": "2026-10-09 12:44:35",
+  "model_path": "ml_engine\\models\\isolation_forest.joblib",
+  "status": "LOADED"
+}

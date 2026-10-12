@@ -1,0 +1,73 @@
+{
+  "incident_id": "INC-1565E73C",
+  "timestamp": 1791530074.95605,
+  "formatted_time": "2026-10-09 12:44:34",
+  "source": "127.0.0.1",
+  "domain": "saf0426-q001-t001-krcvgvbnifieslkqifmuyt2biq.lab.dnsshield.local",
+  "parent_domain": "lab.dnsshield.local",
+  "risk_score": 25,
+  "severity": "LOW",
+  "indicators": [
+    {
+      "indicator": "HIGH_ENTROPY",
+      "observed_value": 4.37,
+      "threshold": 4.2,
+      "severity": "MEDIUM",
+      "explanation": "Observed Shannon entropy of 4.37 on 'saf0426-q001-t001-krcvgvbnifieslkqifmuyt2biq' exceeded configured MEDIUM threshold of 4.20. High character randomness indicates encoded/encrypted DNS payload chunking.",
+      "confidence": "MEDIUM"
+    },
+    {
+      "indicator": "SUSPICIOUS_LABEL_LENGTH",
+      "observed_value": 44,
+      "threshold": 40,
+      "severity": "MEDIUM",
+      "explanation": "Maximum label length (44 chars) exceeded threshold (40 chars).",
+      "confidence": "HIGH"
+    }
+  ],
+  "feature_values": {
+    "qname": "saf0426-q001-t001-krcvgvbnifieslkqifmuyt2biq.lab.dnsshield.local",
+    "subdomain": "saf0426-q001-t001-krcvgvbnifieslkqifmuyt2biq",
+    "domain_length": 64,
+    "subdomain_length": 44,
+    "label_count": 4,
+    "maximum_label_length": 44,
+    "average_label_length": 15.25,
+    "shannon_entropy": 4.3714,
+    "digit_ratio": 0.25,
+    "uppercase_ratio": 0.0,
+    "special_character_ratio": 0.0,
+    "unique_character_ratio": 0.5455,
+    "query_frequency": 0.0167,
+    "unique_subdomain_rate": 1.0,
+    "TXT_request_rate": 0.0,
+    "NXDOMAIN_rate": 0.0,
+    "average_packet_size": 104.0,
+    "unique_subdomain_count_1m": 1,
+    "txt_request_rate": 0.0,
+    "nxdomain_rate": 0.0
+  },
+  "ML_result": {
+    "is_anomalous": true,
+    "anomaly_score": 0.4656,
+    "raw_decision_score": -0.0328,
+    "prediction": -1,
+    "prediction_label": "ANOMALOUS",
+    "model_status": "LOADED"
+  },
+  "explanation": "Reason: High correlation across [High Entropy, Suspicious Label Length]. ML Model: Flagged as anomalous (Anomaly Index: 0.47).",
+  "recommended_defensive_action": [
+    "Monitor source host DNS query velocity for baseline drift.",
+    "Verify parent domain reputation and WHOIS creation timestamp.",
+    "Isolate host endpoint and inspect active processes querying local DNS resolvers.",
+    "Block parent domain on enterprise DNS firewall / RPZ (Response Policy Zone)."
+  ],
+  "mitre_mapping": {
+    "technique_id": "T1071.004",
+    "technique_name": "Application Layer Protocol: DNS",
+    "tactic": "Command and Control / Exfiltration",
+    "observed_behavior": "High entropy/frequency DNS queries for 'lab.dnsshield.local'",
+    "detection_hypothesis": "Covert DNS tunneling session embedding structured payload chunks in host subdomains.",
+    "status": "BENIGN BASELINE"
+  }
+}

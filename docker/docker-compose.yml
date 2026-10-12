@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  dnsshield-api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+    container_name: dnsshield-api
+    ports:
+      - "8000:8000"
+    networks:
+      dnsshield-net:
+        ipv4_address: 172.28.0.10
+    restart: unless-stopped
+
+  dnsshield-lab-dns:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.dns
+    container_name: dnsshield-lab-dns
+    ports:
+      - "5353:5353/udp"
+    networks:
+      dnsshield-net:
+        ipv4_address: 172.28.0.20
+    restart: unless-stopped
+
+  dnsshield-dashboard:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.dashboard
+    container_name: dnsshield-dashboard
+    ports:
+      - "8080:80"
+    depends_on:
+      - dnsshield-api
+    networks:
+      dnsshield-net:
+        ipv4_address: 172.28.0.30
+    restart: unless-stopped
+
+networks:
+  dnsshield-net:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

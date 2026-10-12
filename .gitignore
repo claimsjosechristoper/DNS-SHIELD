@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+.coverage
+htmlcov/
+*.log
+data/*.db
+data/dns_gateway.db
+data/test.db
+.env
+local_secrets/

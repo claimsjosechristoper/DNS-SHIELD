@@ -1,0 +1,12 @@
+# Command & Control (C2) Domain Threat Feed (Local Curated Test Feed)
+# Known C2 Controllers, Beaconing Hubs, and Exfiltration Endpoints
+cobaltstrike-listener.test
+c2-exfil-server.test
+dns-tunnel-hub.test
+beacon-heartbeat.bad
+rat-controller.invalid
+empire-listener-node.test
+sliver-c2-gateway.test
+adversary-c2-infrastructure.test
+covert-channel.evil
+covert-exfil.test

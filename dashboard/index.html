@@ -1,0 +1,654 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DNS Security Gateway | Deterministic Threat Enforcement</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <header>
+        <div class="logo-container">
+            <h1>DNS SECURITY GATEWAY</h1>
+            <p>Deterministic Policy Enforcement & Zero-Risk-Score Threat Mitigation</p>
+        </div>
+        <div class="header-badges">
+            <span class="badge-info" id="gateway-listener-badge">UDP/TCP: 127.0.0.1:5353</span>
+            <button class="btn btn-sm" onclick="openKeyModal()">
+                <span id="auth-status-indicator">🔑 API Key</span>
+            </button>
+            <div class="status-badge" id="system-status">
+                <div class="pulse-dot"></div>
+                <span id="gateway-status-text">GATEWAY ONLINE</span>
+            </div>
+        </div>
+    </header>
+
+    <!-- Navigation Tabs -->
+    <div class="tabs">
+        <button class="tab-btn active" onclick="switchTab('tab-overview')">
+            <span>📊</span> Overview & Live Monitor
+        </button>
+        <button class="tab-btn" onclick="switchTab('tab-logs')">
+            <span>📜</span> DNS Query Logs
+        </button>
+        <button class="tab-btn" onclick="switchTab('tab-rules')">
+            <span>🛡️</span> Custom Block Rules
+        </button>
+        <button class="tab-btn" onclick="switchTab('tab-allowlist')">
+            <span>✅</span> Allowlist Entries
+        </button>
+        <button class="tab-btn" onclick="switchTab('tab-blocklists')">
+            <span>🚨</span> Threat Blocklists
+        </button>
+        <button class="tab-btn" onclick="switchTab('tab-upstreams')">
+            <span>🌐</span> Upstream Resolvers
+        </button>
+        <button class="tab-btn" onclick="switchTab('tab-settings')">
+            <span>⚙️</span> Record Types & Settings
+        </button>
+        <button class="tab-btn" onclick="switchTab('tab-audit')">
+            <span>🔒</span> Audit Trail
+        </button>
+    </div>
+
+    <!-- TAB 1: OVERVIEW & LIVE MONITOR -->
+    <div id="tab-overview" class="tab-content">
+        <!-- Precedence Banner -->
+        <div class="precedence-flow">
+            <span style="font-weight: 700; color: var(--text-muted);">Enforcement Pipeline:</span>
+            <span class="p-step">1. Protocol Check</span>
+            <span class="p-arrow">➔</span>
+            <span class="p-step">2. Access Control (CIDR)</span>
+            <span class="p-arrow">➔</span>
+            <span class="p-step">3. Rate Limit</span>
+            <span class="p-arrow">➔</span>
+            <span class="p-step highlight-allow">4. Allowlist Override</span>
+            <span class="p-arrow">➔</span>
+            <span class="p-step highlight-block">5. Admin Policy Rules</span>
+            <span class="p-arrow">➔</span>
+            <span class="p-step highlight-block">6. Record Types</span>
+            <span class="p-arrow">➔</span>
+            <span class="p-step highlight-block">7. Threat Feeds</span>
+            <span class="p-arrow">➔</span>
+            <span class="p-step highlight-allow">8. Upstream / Cache</span>
+        </div>
+
+        <!-- Metric KPI Cards -->
+        <div class="metrics-grid">
+            <div class="metric-card">
+                <div class="metric-title">Total DNS Requests</div>
+                <div class="metric-value" id="stat-total-queries">0</div>
+                <div class="metric-sub">Processed through gateway</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-title">Allowed Requests</div>
+                <div class="metric-value" style="color: var(--decision-allow);" id="stat-allowed-queries">0</div>
+                <div class="metric-sub">Resolved via cache/upstream</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-title">Blocked Requests</div>
+                <div class="metric-value" style="color: var(--decision-block);" id="stat-blocked-queries">0</div>
+                <div class="metric-sub">Refused by security policy</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-title">Active Threat Rules</div>
+                <div class="metric-value" id="stat-blocklist-entries">0</div>
+                <div class="metric-sub" id="stat-blocklist-sources-sub">Loaded across threat feeds</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-title">Resolver Health</div>
+                <div class="metric-value" style="font-size: 1.4rem; color: var(--decision-allow);" id="stat-resolver-health">ONLINE</div>
+                <div class="metric-sub" id="stat-upstreams-count">Primary: 1.1.1.1</div>
+            </div>
+        </div>
+
+        <!-- Charts Grid -->
+        <div class="charts-grid">
+            <div class="chart-card">
+                <div class="chart-header">
+                    <div class="chart-title">Real-Time Traffic Decisions (ALLOW vs BLOCK)</div>
+                    <span class="badge-type">Streaming</span>
+                </div>
+                <canvas id="chart-traffic" height="110"></canvas>
+            </div>
+            <div class="chart-card">
+                <div class="chart-header">
+                    <div class="chart-title">Enforcement Decision Breakdown</div>
+                </div>
+                <canvas id="chart-decisions" height="110"></canvas>
+            </div>
+        </div>
+
+        <!-- Split Grid: Top Blocked Domains & Live Stream -->
+        <div class="split-grid">
+            <!-- Top Blocked Domains -->
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">Top Policy & Threat Blocked Domains</div>
+                </div>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Blocked Domain</th>
+                                <th>Hits</th>
+                                <th>Category / Rule</th>
+                            </tr>
+                        </thead>
+                        <tbody id="top-blocked-table-body">
+                            <tr><td colspan="3" style="text-align:center; color: var(--text-muted);">No blocked requests recorded yet</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Live Streaming Query Feed -->
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">
+                        <span>Live Gateway Query Stream</span>
+                        <div class="pulse-dot"></div>
+                    </div>
+                    <span style="font-size: 0.75rem; color: var(--text-muted);">WebSocket Connected</span>
+                </div>
+                <div class="table-container" style="max-height: 380px; overflow-y: auto;">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Time</th>
+                                <th>Client</th>
+                                <th>Domain</th>
+                                <th>Decision</th>
+                                <th>Reason</th>
+                            </tr>
+                        </thead>
+                        <tbody id="live-stream-table-body">
+                            <!-- Dynamically populated from WebSocket -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- TAB 2: DNS QUERY LOGS -->
+    <div id="tab-logs" class="tab-content" style="display: none;">
+        <div class="panel">
+            <div class="panel-header">
+                <div class="panel-title">Deterministic DNS Query Logs & Forensics</div>
+                <div style="display: flex; gap: 0.5rem;">
+                    <button class="btn btn-sm" onclick="exportLogsCSV()">Export CSV</button>
+                    <button class="btn btn-sm btn-cyan" onclick="loadLogs()">Refresh</button>
+                </div>
+            </div>
+
+            <!-- Filter Controls -->
+            <div style="display: flex; gap: 0.75rem; flex-wrap: wrap; margin-bottom: 1rem;">
+                <input type="text" id="filter-search" placeholder="Search domain..." style="flex: 2; min-width: 180px;" oninput="debounceLogs()">
+                <select id="filter-decision" onchange="loadLogs()">
+                    <option value="">All Decisions</option>
+                    <option value="ALLOW">ALLOW</option>
+                    <option value="BLOCK">BLOCK</option>
+                </select>
+                <select id="filter-type" onchange="loadLogs()">
+                    <option value="">All Reasons / Types</option>
+                    <option value="THREAT_BLOCKLIST">Threat Blocklist</option>
+                    <option value="ADMIN_POLICY">Admin Policy</option>
+                    <option value="RECORD_TYPE">Record Type</option>
+                    <option value="RATE_LIMIT">Rate Limit</option>
+                    <option value="ACCESS_DENIED">Access Denied</option>
+                    <option value="PROTOCOL_VIOLATION">Protocol Violation</option>
+                    <option value="ALLOWED">Allowed Upstream</option>
+                </select>
+                <input type="text" id="filter-client" placeholder="Client IP..." style="width: 140px;" oninput="debounceLogs()">
+                <input type="text" id="filter-qtype" placeholder="Type (A, TXT)..." style="width: 120px;" oninput="debounceLogs()">
+            </div>
+
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Timestamp</th>
+                            <th>Client IP</th>
+                            <th>Domain</th>
+                            <th>Type</th>
+                            <th>Decision</th>
+                            <th>Matched Rule</th>
+                            <th>Reason</th>
+                            <th>RCODE</th>
+                            <th>Latency / Upstream</th>
+                            <th>Inspect</th>
+                        </tr>
+                    </thead>
+                    <tbody id="logs-table-body">
+                        <!-- Populated dynamically -->
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Pagination -->
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 1rem; font-size: 0.85rem; color: var(--text-muted);">
+                <span id="logs-pagination-info">Showing 0 of 0 logs</span>
+                <div style="display: flex; gap: 0.5rem;">
+                    <button class="btn btn-sm" id="btn-prev-page" onclick="prevLogsPage()" disabled>Previous</button>
+                    <button class="btn btn-sm" id="btn-next-page" onclick="nextLogsPage()">Next</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- TAB 3: CUSTOM BLOCKING RULES -->
+    <div id="tab-rules" class="tab-content" style="display: none;">
+        <div class="panel">
+            <div class="panel-header">
+                <div>
+                    <div class="panel-title">Administrator-Managed Custom Blocking Rules</div>
+                    <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem;">
+                        Explicit domain and subdomain rules. Subdomain rules strictly block <code>*.example.com</code> without affecting <code>notexample.com</code>.
+                    </p>
+                </div>
+                <button class="btn btn-cyan" onclick="openAddRuleModal()">+ Add Custom Block Rule</button>
+            </div>
+
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Domain</th>
+                            <th>Match Scope</th>
+                            <th>Status</th>
+                            <th>Policy Reason</th>
+                            <th>Created</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="custom-rules-table-body">
+                        <!-- Populated dynamically -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- TAB 4: ALLOWLIST ENTRIES -->
+    <div id="tab-allowlist" class="tab-content" style="display: none;">
+        <div class="panel">
+            <div class="panel-header">
+                <div>
+                    <div class="panel-title">Administrator Allowlist Entries</div>
+                    <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem;">
+                        Allowlist overrides threat blocklists and custom block rules. Allowlist entries <strong>never</strong> bypass protocol validation or resource limits.
+                    </p>
+                </div>
+                <button class="btn btn-cyan" onclick="openAddAllowlistModal()">+ Add Allowlist Entry</button>
+            </div>
+
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Exempt Domain</th>
+                            <th>Match Scope</th>
+                            <th>Status</th>
+                            <th>Exemption Rationale</th>
+                            <th>Created</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="allowlist-table-body">
+                        <!-- Populated dynamically -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- TAB 5: THREAT BLOCKLISTS -->
+    <div id="tab-blocklists" class="tab-content" style="display: none;">
+        <div class="panel">
+            <div class="panel-header">
+                <div>
+                    <div class="panel-title">Validated Threat Blocklists (Malware, Phishing, C2)</div>
+                    <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem;">
+                        Updates are validated and swapped atomically in memory. If an update fails or is corrupt, the <strong>last known good list</strong> is retained.
+                    </p>
+                </div>
+                <div style="display: flex; gap: 0.5rem;">
+                    <button class="btn btn-cyan" onclick="syncAllBlocklists()">🔄 Sync All Feeds</button>
+                    <button class="btn" onclick="openAddBlocklistModal()">+ Add Threat Feed</button>
+                </div>
+            </div>
+
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Feed Title</th>
+                            <th>Category</th>
+                            <th>Source Path / URL</th>
+                            <th>Active Domains</th>
+                            <th>Status</th>
+                            <th>Last Updated</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="blocklists-table-body">
+                        <!-- Populated dynamically -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- TAB 6: UPSTREAM RESOLVERS -->
+    <div id="tab-upstreams" class="tab-content" style="display: none;">
+        <div class="panel">
+            <div class="panel-header">
+                <div>
+                    <div class="panel-title">Upstream DNS Resolvers & Health Monitoring</div>
+                    <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem;">
+                        Permitted queries are forwarded to upstreams in priority order. Returns <code>SERVFAIL</code> on upstream failure; never fabricates answers.
+                    </p>
+                </div>
+                <button class="btn btn-cyan" onclick="openAddUpstreamModal()">+ Add Upstream Resolver</button>
+            </div>
+
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Resolver Address</th>
+                            <th>Port</th>
+                            <th>Protocol</th>
+                            <th>Priority</th>
+                            <th>Health</th>
+                            <th>Latency</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="upstreams-table-body">
+                        <!-- Populated dynamically -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- TAB 7: SETTINGS & RECORD TYPES -->
+    <div id="tab-settings" class="tab-content" style="display: none;">
+        <div class="split-grid">
+            <!-- Blocked Record Types -->
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">Prohibited DNS Record Types</div>
+                    <button class="btn btn-sm btn-cyan" onclick="openAddRecordTypeModal()">+ Block Record Type</button>
+                </div>
+                <p style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 1rem;">
+                    Block specified QTYPEs (e.g. ANY query amplification mitigation per RFC 8482).
+                </p>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Record Type</th>
+                                <th>Reason</th>
+                                <th>Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="record-types-table-body">
+                            <!-- Populated dynamically -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Gateway Policy Settings -->
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">Gateway Configuration & Access Control</div>
+                </div>
+                <form id="settings-form" onsubmit="saveGatewaySettings(event)">
+                    <div style="margin-bottom: 1rem;">
+                        <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.35rem;">
+                            Blocked Response Code:
+                        </label>
+                        <select id="setting-blocked-rcode" style="width: 100%;">
+                            <option value="REFUSED">REFUSED (Standard Policy Rejection)</option>
+                            <option value="NXDOMAIN">NXDOMAIN (Non-Existent Domain)</option>
+                        </select>
+                    </div>
+
+                    <div style="margin-bottom: 1rem;">
+                        <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.35rem;">
+                            Allowed Client Networks (CIDRs):
+                        </label>
+                        <input type="text" id="setting-allowed-networks" style="width: 100%; font-family: var(--font-mono); font-size: 0.8rem;" placeholder="127.0.0.0/8,192.168.0.0/16,10.0.0.0/8">
+                        <small style="color: var(--text-dim); font-size: 0.72rem;">Defends against open public resolver abuse.</small>
+                    </div>
+
+                    <div style="margin-bottom: 1.25rem;">
+                        <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.35rem;">
+                            Log Retention (Days):
+                        </label>
+                        <input type="number" id="setting-retention-days" min="1" max="365" style="width: 100%;">
+                    </div>
+
+                    <div style="display: flex; gap: 0.75rem;">
+                        <button type="submit" class="btn btn-cyan">Save Settings</button>
+                        <button type="button" class="btn btn-danger" onclick="triggerLogPrune()">Prune Old Logs Now</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- TAB 8: AUDIT TRAIL -->
+    <div id="tab-audit" class="tab-content" style="display: none;">
+        <div class="panel">
+            <div class="panel-header">
+                <div class="panel-title">Administrative Audit Trail</div>
+                <button class="btn btn-sm" onclick="loadAuditLogs()">Refresh Audit Trail</button>
+            </div>
+            <p style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 1rem;">
+                Cryptographically verifiable audit records of all rule modifications, feed updates, and configuration changes.
+            </p>
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Timestamp</th>
+                            <th>Admin</th>
+                            <th>Action</th>
+                            <th>Target</th>
+                            <th>Details</th>
+                        </tr>
+                    </thead>
+                    <tbody id="audit-table-body">
+                        <!-- Populated dynamically -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL: ADD CUSTOM BLOCK RULE -->
+    <div id="modal-add-rule" class="modal-overlay" style="display: none;">
+        <div class="modal-content">
+            <button class="close-btn" onclick="closeModals()">&times;</button>
+            <h2 style="font-size: 1.2rem; margin-bottom: 1rem; color: var(--accent-cyan);">Add Custom Blocking Rule</h2>
+            <form onsubmit="submitAddRule(event)">
+                <div style="margin-bottom: 1rem;">
+                    <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.25rem;">Domain:</label>
+                    <input type="text" id="new-rule-domain" placeholder="e.g. tracking-server.internal" required style="width: 100%;">
+                </div>
+                <div style="margin-bottom: 1rem;">
+                    <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.25rem;">Match Scope:</label>
+                    <select id="new-rule-type" style="width: 100%;">
+                        <option value="subdomain">Domain & all Subdomains (*.domain.com)</option>
+                        <option value="exact">Exact Domain Only</option>
+                    </select>
+                </div>
+                <div style="margin-bottom: 1.25rem;">
+                    <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.25rem;">Policy Rationale:</label>
+                    <input type="text" id="new-rule-reason" placeholder="e.g. Corporate policy prohibition" style="width: 100%;">
+                </div>
+                <div style="display: flex; justify-content: flex-end; gap: 0.5rem;">
+                    <button type="button" class="btn" onclick="closeModals()">Cancel</button>
+                    <button type="submit" class="btn btn-cyan">Enforce Rule</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- MODAL: ADD ALLOWLIST ENTRY -->
+    <div id="modal-add-allowlist" class="modal-overlay" style="display: none;">
+        <div class="modal-content">
+            <button class="close-btn" onclick="closeModals()">&times;</button>
+            <h2 style="font-size: 1.2rem; margin-bottom: 1rem; color: var(--decision-allow);">Add Allowlist Entry</h2>
+            <form onsubmit="submitAddAllowlist(event)">
+                <div style="margin-bottom: 1rem;">
+                    <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.25rem;">Domain:</label>
+                    <input type="text" id="new-allow-domain" placeholder="e.g. authorized-api.com" required style="width: 100%;">
+                </div>
+                <div style="margin-bottom: 1rem;">
+                    <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.25rem;">Match Scope:</label>
+                    <select id="new-allow-type" style="width: 100%;">
+                        <option value="subdomain">Domain & all Subdomains (*.domain.com)</option>
+                        <option value="exact">Exact Domain Only</option>
+                    </select>
+                </div>
+                <div style="margin-bottom: 1.25rem;">
+                    <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.25rem;">Exemption Reason:</label>
+                    <input type="text" id="new-allow-reason" placeholder="e.g. Critical business partner endpoint" style="width: 100%;">
+                </div>
+                <div style="display: flex; justify-content: flex-end; gap: 0.5rem;">
+                    <button type="button" class="btn" onclick="closeModals()">Cancel</button>
+                    <button type="submit" class="btn btn-cyan">Add Exemption</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- MODAL: ADD THREAT BLOCKLIST FEED -->
+    <div id="modal-add-blocklist" class="modal-overlay" style="display: none;">
+        <div class="modal-content">
+            <button class="close-btn" onclick="closeModals()">&times;</button>
+            <h2 style="font-size: 1.2rem; margin-bottom: 1rem; color: var(--accent-cyan);">Add Threat Feed Source</h2>
+            <form onsubmit="submitAddBlocklist(event)">
+                <div style="margin-bottom: 1rem;">
+                    <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.25rem;">Feed Title:</label>
+                    <input type="text" id="new-feed-name" placeholder="e.g. C2 Tracker Feed" required style="width: 100%;">
+                </div>
+                <div style="margin-bottom: 1rem;">
+                    <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.25rem;">Category:</label>
+                    <select id="new-feed-category" style="width: 100%;">
+                        <option value="malware">Malware & Ransomware</option>
+                        <option value="phishing">Phishing & Credential Harvest</option>
+                        <option value="c2">Command & Control (C2)</option>
+                        <option value="policy">Policy / Advertising</option>
+                    </select>
+                </div>
+                <div style="margin-bottom: 1.25rem;">
+                    <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.25rem;">URL or Local Filepath:</label>
+                    <input type="text" id="new-feed-path" placeholder="https://... or data/blocklists/..." required style="width: 100%;">
+                </div>
+                <div style="display: flex; justify-content: flex-end; gap: 0.5rem;">
+                    <button type="button" class="btn" onclick="closeModals()">Cancel</button>
+                    <button type="submit" class="btn btn-cyan">Register & Sync</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- MODAL: ADD RECORD TYPE -->
+    <div id="modal-add-record-type" class="modal-overlay" style="display: none;">
+        <div class="modal-content">
+            <button class="close-btn" onclick="closeModals()">&times;</button>
+            <h2 style="font-size: 1.2rem; margin-bottom: 1rem; color: var(--accent-cyan);">Block DNS Record Type</h2>
+            <form onsubmit="submitAddRecordType(event)">
+                <div style="margin-bottom: 1rem;">
+                    <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.25rem;">Record Type (QTYPE):</label>
+                    <input type="text" id="new-record-type" placeholder="e.g. ANY, NULL, TXT" required style="width: 100%;">
+                </div>
+                <div style="margin-bottom: 1.25rem;">
+                    <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.25rem;">Reason:</label>
+                    <input type="text" id="new-record-reason" placeholder="e.g. RFC 8482 ANY Amplification Mitigation" style="width: 100%;">
+                </div>
+                <div style="display: flex; justify-content: flex-end; gap: 0.5rem;">
+                    <button type="button" class="btn" onclick="closeModals()">Cancel</button>
+                    <button type="submit" class="btn btn-cyan">Block Record Type</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- MODAL: ADD UPSTREAM RESOLVER -->
+    <div id="modal-add-upstream" class="modal-overlay" style="display: none;">
+        <div class="modal-content">
+            <button class="close-btn" onclick="closeModals()">&times;</button>
+            <h2 style="font-size: 1.2rem; margin-bottom: 1rem; color: var(--accent-cyan);">Add Upstream Resolver</h2>
+            <form onsubmit="submitAddUpstream(event)">
+                <div style="margin-bottom: 1rem;">
+                    <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.25rem;">IP Address:</label>
+                    <input type="text" id="new-upstream-addr" placeholder="e.g. 1.1.1.1" required style="width: 100%;">
+                </div>
+                <div style="margin-bottom: 1rem; display: flex; gap: 1rem;">
+                    <div style="flex: 1;">
+                        <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.25rem;">Port:</label>
+                        <input type="number" id="new-upstream-port" value="53" required style="width: 100%;">
+                    </div>
+                    <div style="flex: 1;">
+                        <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.25rem;">Protocol:</label>
+                        <select id="new-upstream-proto" style="width: 100%;">
+                            <option value="UDP">UDP</option>
+                            <option value="TCP">TCP</option>
+                        </select>
+                    </div>
+                    <div style="flex: 1;">
+                        <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.25rem;">Priority:</label>
+                        <input type="number" id="new-upstream-prio" value="1" min="1" required style="width: 100%;">
+                    </div>
+                </div>
+                <div style="display: flex; justify-content: flex-end; gap: 0.5rem;">
+                    <button type="button" class="btn" onclick="closeModals()">Cancel</button>
+                    <button type="submit" class="btn btn-cyan">Add Upstream</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- MODAL: SET API KEY -->
+    <div id="modal-api-key" class="modal-overlay" style="display: none;">
+        <div class="modal-content">
+            <button class="close-btn" onclick="closeModals()">&times;</button>
+            <h2 style="font-size: 1.2rem; margin-bottom: 1rem; color: var(--accent-cyan);">Administrator Authentication</h2>
+            <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1rem;">
+                Administrative actions (creating rules, updating settings, syncing blocklists) require an API key.
+            </p>
+            <form onsubmit="saveApiKey(event)">
+                <div style="margin-bottom: 1.25rem;">
+                    <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.25rem;">API Key:</label>
+                    <input type="password" id="input-api-key" placeholder="Enter administrative API key..." required style="width: 100%; font-family: var(--font-mono);">
+                </div>
+                <div style="display: flex; justify-content: flex-end; gap: 0.5rem;">
+                    <button type="button" class="btn" onclick="closeModals()">Cancel</button>
+                    <button type="submit" class="btn btn-cyan">Authorize Session</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- MODAL: LOG INSPECT -->
+    <div id="modal-log-inspect" class="modal-overlay" style="display: none;">
+        <div class="modal-content" style="max-width: 650px;">
+            <button class="close-btn" onclick="closeModals()">&times;</button>
+            <h2 style="font-size: 1.2rem; margin-bottom: 1rem; color: var(--accent-cyan);">DNS Query Audit Inspection</h2>
+            <pre id="log-inspect-json" style="background: #080c14; padding: 1rem; border-radius: 0.5rem; border: 1px solid var(--border-color); font-family: var(--font-mono); font-size: 0.8rem; overflow-x: auto; max-height: 400px; color: #a5f3fc;"></pre>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

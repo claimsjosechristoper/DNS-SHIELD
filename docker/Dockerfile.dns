@@ -1,0 +1,12 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir dnslib
+
+COPY dns_simulator/ dns_simulator/
+
+EXPOSE 5353/udp
+
+CMD ["python", "-c", "from dns_simulator.lab_dns_server import LabDNSServer; import time; server=LabDNSServer('0.0.0.0', 5353); server.start(); time.sleep(10000000)"]
