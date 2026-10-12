@@ -1,17 +1,20 @@
 """
-Upstream DNS Forwarding Engine with UDP/TCP Support, Failover, and Health Monitoring.
+Upstream DNS Forwarding Engine with IPv4/IPv6, UDP/TCP Support, Response Validation,
+Failover, and Health Monitoring.
 Never fabricates answers; returns SERVFAIL on upstream network failure.
 """
 
 import socket
 import struct
 import time
+import secrets
 import logging
 from typing import List, Dict, Any, Optional, Tuple
 from dnslib import DNSRecord, RCODE, DNSQuestion, QTYPE
 from gateway.config import GatewayConfig
 
 logger = logging.getLogger("DNSShield.Upstream")
+
 
 class UpstreamResolver:
     def __init__(self, upstreams: Optional[List[Dict[str, Any]]] = None):
@@ -30,31 +33,88 @@ class UpstreamResolver:
     def forward_query(self, raw_query: bytes, client_tx_id: int) -> Tuple[Optional[bytes], str, float, str]:
         """
         Forwards DNS query to configured upstream resolvers with priority failover.
+        Validates response transaction ID, QR flag, and question matching.
         Returns:
             (response_bytes, upstream_used, latency_ms, status)
         """
+        parsed_query = None
+        orig_qname = None
+        orig_qtype = None
+        try:
+            parsed_query = DNSRecord.parse(raw_query)
+            if parsed_query.questions:
+                orig_qname = parsed_query.q.qname
+                orig_qtype = parsed_query.q.qtype
+        except Exception:
+            pass
+
         for up in self.upstreams:
             addr = up.get("address", "1.1.1.1")
             port = int(up.get("port", 53))
             protocol = up.get("protocol", "UDP").upper()
 
+            # Randomize transaction ID sent to upstream to mitigate spoofing
+            upstream_tx_id = secrets.randbelow(65535) + 1
+            if parsed_query:
+                parsed_query.header.id = upstream_tx_id
+                upstream_query_bytes = parsed_query.pack()
+            else:
+                upstream_query_bytes = raw_query
+
             start_t = time.time()
             try:
-                resp_bytes = self._query_server(raw_query, addr, port, protocol)
+                resp_bytes = self._query_server(upstream_query_bytes, addr, port, protocol)
                 if resp_bytes:
+                    # Validate upstream response
+                    validated_resp = self._validate_upstream_response(
+                        resp_bytes, upstream_tx_id, orig_qname, orig_qtype, client_tx_id
+                    )
                     latency = round((time.time() - start_t) * 1000, 2)
                     up["health_status"] = "HEALTHY"
                     up["last_latency_ms"] = latency
                     up["last_checked"] = time.time()
-                    return resp_bytes, f"{addr}:{port}", latency, "NOERROR"
+                    return validated_resp, f"{addr}:{port}", latency, "NOERROR"
             except Exception as e:
-                logger.warning(f"Upstream {addr}:{port} failed: {e}. Attempting failover...")
+                logger.warning(f"Upstream {addr}:{port} failed or validation rejected: {e}. Attempting failover...")
                 up["health_status"] = "UNREACHABLE"
                 up["last_checked"] = time.time()
 
         # All upstreams exhausted or unreachable: synthesize SERVFAIL (RFC 1035)
         servfail_bytes = self._build_servfail(raw_query, client_tx_id)
         return servfail_bytes, "NONE", 0.0, "SERVFAIL"
+
+    def _validate_upstream_response(
+        self,
+        resp_bytes: bytes,
+        expected_tx_id: int,
+        orig_qname: Any,
+        orig_qtype: Any,
+        client_tx_id: int
+    ) -> bytes:
+        """
+        Strictly validates the upstream response packet:
+        1. Valid DNS packet structure.
+        2. QR bit must be 1 (response).
+        3. Transaction ID must match expected_tx_id.
+        4. Question section (if present) must match original question name and type.
+        Rewrites header transaction ID to match client_tx_id.
+        """
+        record = DNSRecord.parse(resp_bytes)
+        if record.header.qr != 1:
+            raise ValueError("Upstream packet is not a DNS response (QR!=1)")
+
+        if record.header.id != expected_tx_id:
+            raise ValueError(f"Transaction ID mismatch: expected {expected_tx_id}, got {record.header.id}")
+
+        if orig_qname is not None and record.questions:
+            if record.q.qname != orig_qname:
+                raise ValueError(f"Question name mismatch: expected {orig_qname}, got {record.q.qname}")
+            if orig_qtype is not None and record.q.qtype != orig_qtype:
+                raise ValueError(f"Question type mismatch: expected {orig_qtype}, got {record.q.qtype}")
+
+        # Rewrite transaction ID to client_tx_id
+        record.header.id = client_tx_id
+        return record.pack()
 
     def _query_server(self, raw_query: bytes, host: str, port: int, protocol: str) -> Optional[bytes]:
         if protocol == "TCP":
@@ -72,45 +132,66 @@ class UpstreamResolver:
             return resp
 
     def _query_udp(self, raw_query: bytes, host: str, port: int) -> bytes:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        """Queries upstream DNS over UDP with IPv4 and IPv6 support."""
+        addrinfo = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_DGRAM)
+        if not addrinfo:
+            raise ConnectionError(f"Cannot resolve upstream host: {host}")
+
+        family, socktype, proto, _, sockaddr = addrinfo[0]
+        sock = socket.socket(family, socktype, proto)
         sock.settimeout(self.timeout)
         try:
-            sock.sendto(raw_query, (host, port))
+            sock.sendto(raw_query, sockaddr)
             data, _ = sock.recvfrom(4096)
             return data
         finally:
             sock.close()
 
     def _query_tcp(self, raw_query: bytes, host: str, port: int) -> bytes:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        """Queries upstream DNS over TCP with IPv4/IPv6 support and exact frame reading."""
+        addrinfo = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        if not addrinfo:
+            raise ConnectionError(f"Cannot resolve upstream host: {host}")
+
+        family, socktype, proto, _, sockaddr = addrinfo[0]
+        sock = socket.socket(family, socktype, proto)
         sock.settimeout(self.timeout)
         try:
-            sock.connect((host, port))
+            sock.connect(sockaddr)
             # 2-byte length prefix
             prefix = struct.pack("!H", len(raw_query))
             sock.sendall(prefix + raw_query)
 
-            len_buf = sock.recv(2)
-            if len(len_buf) < 2:
+            # Read 2-byte length prefix exactly
+            len_buf = self._recv_exact(sock, 2)
+            if not len_buf:
                 raise ConnectionError("Truncated TCP DNS length header")
             resp_len = struct.unpack("!H", len_buf)[0]
 
-            received = b""
-            while len(received) < resp_len:
-                chunk = sock.recv(min(4096, resp_len - len(received)))
-                if not chunk:
-                    break
-                received += chunk
-
-            return received
+            # Read payload exactly
+            data = self._recv_exact(sock, resp_len)
+            if data is None or len(data) < resp_len:
+                raise ConnectionError("Incomplete TCP DNS response payload")
+            return data
         finally:
             sock.close()
+
+    @staticmethod
+    def _recv_exact(sock: socket.socket, size: int) -> Optional[bytes]:
+        data = bytearray()
+        while len(data) < size:
+            chunk = sock.recv(size - len(data))
+            if not chunk:
+                return None
+            data.extend(chunk)
+        return bytes(data)
 
     def _build_servfail(self, raw_query: bytes, client_tx_id: int) -> bytes:
         """Synthesizes RFC-compliant SERVFAIL response."""
         try:
             req = DNSRecord.parse(raw_query)
             rep = req.reply()
+            rep.header.id = client_tx_id
             rep.header.rcode = getattr(RCODE, "SERVFAIL")
             return rep.pack()
         except Exception:

@@ -7,8 +7,10 @@ and protocol label boundary constraints.
 import re
 from typing import Tuple
 
-# RFC 1035 / RFC 1123 label pattern: alphanumeric and hyphen, cannot start or end with hyphen
-LABEL_PATTERN = re.compile(r"^[a-z0-9]([a-z0-9-_]{0,61}[a-z0-9])?$")
+# RFC 1035 / RFC 1123 / RFC 2181 DNS owner name label pattern:
+# Allows alphanumeric, hyphen, underscore (RFC 2782 SRV, RFC 7489 DMARC, RFC 6376 DKIM, etc.)
+# Disallows leading or trailing hyphens; allows wildcards (*).
+LABEL_PATTERN = re.compile(r"^(\*|[a-z0-9_]([a-z0-9-_]{0,61}[a-z0-9_])?)$")
 
 def normalize_domain(domain: str) -> Tuple[str, bool, str]:
     """

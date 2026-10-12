@@ -18,6 +18,7 @@ from gateway.rate_limiter import RateLimiter
 from gateway.cache import DNSCache
 from gateway.upstream import UpstreamResolver
 from gateway.db import get_db, log_dns_query
+from detection_engine.tunneling_detector import TunnelingDetector
 
 logger = logging.getLogger("DNSShield.PolicyEngine")
 
@@ -37,6 +38,8 @@ class PolicyEngine:
             max_ttl=GatewayConfig.CACHE_MAX_TTL
         )
         self.upstream_resolver = UpstreamResolver()
+        self.tunneling_detector = TunnelingDetector()
+        self.enable_tunneling_detection = True
 
         # In-memory fast rule indexes
         self.custom_rules_index = RuleIndex()
@@ -283,6 +286,16 @@ class PolicyEngine:
                                      reason, self.blocked_response_rcode)
             self._record_and_notify(event)
             return self.build_blocked_response(request), event
+
+        # PIPELINE STEP 7.5: Explainable DNS Tunneling Heuristics
+        if self.enable_tunneling_detection:
+            is_tunnel, tunnel_reason, _ = self.tunneling_detector.evaluate(norm_domain, qtype_str, client_ip)
+            if is_tunnel:
+                event = self._make_event(start_time, client_ip, norm_domain, qtype_str, "BLOCK",
+                                         "SUSPECTED_TUNNELING", "HEURISTIC_TUNNELING_DETECTION",
+                                         tunnel_reason, self.blocked_response_rcode)
+                self._record_and_notify(event)
+                return self.build_blocked_response(request), event
 
         # PIPELINE STEP 8: Default ALLOW Policy -> Forward to Upstream / Check Cache
         return self._execute_allowed_resolution(request, raw_data, norm_domain, qtype_str, client_ip, start_time,
