@@ -126,6 +126,7 @@ class ServiceRuntime:
                 "delete_allowlist": self.delete_allowlist,
                 "get_network_state": lambda _p: self.get_network_state(),
                 "restore_network": lambda _p: self.network_manager.restore_dns(),
+                "apply_policy": self.apply_policy,
             }
 
             self.ipc = NamedPipeServer(self.ipc_secret_path.read_bytes(), ipc_handlers)
@@ -358,6 +359,55 @@ class ServiceRuntime:
         if self.gateway and self.gateway.policy_engine:
             self.gateway.policy_engine.reload_policies()
         return {"success": True}
+
+    def apply_policy(self, payload: Any) -> Dict[str, Any]:
+        """Validates and applies an asymmetric Ed25519 publisher signed policy envelope."""
+        from hosted_management.policy_verifier import EndpointPolicyVerifier, PolicyVerificationError
+        if not isinstance(payload, dict):
+            raise ValueError("Policy payload must be a JSON object")
+
+        pub_key = payload.get("public_key") or payload.get("policy_public_key")
+        verifier = EndpointPolicyVerifier(
+            trusted_public_key_hex=pub_key,
+            expected_tenant_id=payload.get("tenant_id", ""),
+            db_path=str(self.db_path),
+        )
+        if pub_key and payload.get("key_id"):
+            verifier.keyring[payload["key_id"]] = verifier.public_key
+
+        res = verifier.verify_and_process(payload)
+        if res.get("action") == "noop":
+            return {"status": "no_change", "version": res["version"]}
+
+        # Atomically apply rules to the SQLite database
+        conn = get_db(str(self.db_path))
+        now = time.time()
+        conn.execute("DELETE FROM custom_rules")
+        for r in res.get("custom_rules", []):
+            conn.execute(
+                "INSERT INTO custom_rules (domain, rule_type, action, enabled, reason, created_at, updated_at) VALUES (?, 'subdomain', 'BLOCK', 1, 'Policy Rule', ?, ?)",
+                (r, now, now)
+            )
+        conn.execute("DELETE FROM allowlist")
+        for a in res.get("allowlist", []):
+            conn.execute(
+                "INSERT INTO allowlist (domain, rule_type, enabled, reason, created_at) VALUES (?, 'exact', 1, 'Policy Exemption', ?)",
+                (a, now)
+            )
+        conn.execute("DELETE FROM blocked_record_types")
+        for bt in res.get("blocked_types", []):
+            conn.execute(
+                "INSERT INTO blocked_record_types (qtype, enabled, reason, created_at) VALUES (?, 1, 'Policy Blocked Record', ?)",
+                (bt, now)
+            )
+        conn.commit()
+        conn.close()
+
+        if self.gateway and self.gateway.policy_engine:
+            self.gateway.policy_engine.cache.clear()
+            self.gateway.policy_engine.reload_policies()
+
+        return {"status": "activated", "version": res["version"]}
 
     def get_network_state(self) -> Dict[str, Any]:
         """Returns detected network adapters and routing verification status."""

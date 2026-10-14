@@ -10,8 +10,15 @@ dist/
 .coverage
 htmlcov/
 *.log
-data/*.db
+*.pcap
+*.secret
+*.key
+*.db
+*.db-journal
+*.db-wal
+data/admin_key.txt
 data/dns_gateway.db
 data/test.db
+hosted_management/*.db
 .env
 local_secrets/

@@ -29,6 +29,81 @@ def get_ipc_secret_path() -> Path:
     return program_data / "DNS-SHIELD" / "ipc.secret"
 
 
+def is_elevated_admin() -> bool:
+    """Checks whether the current process is running with administrative elevation."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+
+def find_recovery_script() -> Optional[Path]:
+    """Locates the standalone recovery script in standard install or development locations."""
+    exe_dir = Path(sys.executable).resolve().parent
+    candidates = [
+        exe_dir.parent / "scripts" / "recovery.ps1",
+        exe_dir / "scripts" / "recovery.ps1",
+        exe_dir / "recovery.ps1",
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "DNS-SHIELD" / "scripts" / "recovery.ps1",
+        Path(__file__).resolve().parent / "scripts" / "recovery.ps1",
+        Path.cwd() / "scripts" / "recovery.ps1",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
+def execute_standalone_recovery(recovery_script: Optional[Path] = None) -> Dict[str, Any]:
+    """
+    Executes narrowly scoped network restoration without contacting the background service.
+    Works even if DNSShieldService is completely stopped or uninstalled.
+    If elevated, executes NetworkManager.restore_dns() directly in-process.
+    If unelevated, invokes scripts\\recovery.ps1 with Windows UAC elevation ('runas').
+    """
+    from network_manager import NetworkManager
+    nm = NetworkManager()
+
+    if is_elevated_admin():
+        logger.info("Executing direct in-process recovery as elevated administrator.")
+        return nm.restore_dns()
+
+    script = recovery_script or find_recovery_script()
+    if script and script.exists():
+        logger.info(f"Triggering UAC elevated standalone recovery script: {script}")
+        try:
+            import ctypes
+            # ShellExecuteW with 'runas' prompts standard Windows UAC dialog
+            ret = ctypes.windll.shell32.ShellExecuteW(
+                None,
+                "runas",
+                "powershell.exe",
+                f'-NoProfile -ExecutionPolicy Bypass -File "{script}"',
+                None,
+                1
+            )
+            if ret > 32:
+                time.sleep(1.5)
+                health = nm.check_health(listener_port=53)
+                return {
+                    "success": not health.get("needs_recovery", False),
+                    "method": "uac_script",
+                    "script": str(script),
+                }
+            elif ret == 5:
+                return {"success": False, "error": "Administrative elevation was denied by user."}
+            else:
+                return {"success": False, "error": f"ShellExecute elevation failed with code {ret}"}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+    else:
+        # Fallback to direct restore
+        return nm.restore_dns()
+
+
 class DNSShieldApp(tk.Tk):
     """Native Windows Desktop Interface for DNS-SHIELD."""
 
@@ -76,16 +151,16 @@ class DNSShieldApp(tk.Tk):
 
     def _init_ipc_client(self):
         secret_path = get_ipc_secret_path()
+        secret = None
         if secret_path.exists():
             try:
                 secret = secret_path.read_bytes().strip()
-                self.client = NamedPipeClient(secret)
-                logger.info("IPC client initialized with local secret.")
+                logger.info("IPC client initialized with administrative secret.")
             except Exception as e:
-                logger.warning(f"Failed to read IPC secret: {e}")
-                self.client = None
+                logger.info(f"Unelevated session (secret not accessible: {e}). Operating in read-only monitoring mode.")
         else:
-            self.client = None
+            logger.info("Operating in unelevated read-only monitoring mode.")
+        self.client = NamedPipeClient(secret=secret)
 
     def _configure_styles(self):
         style = ttk.Style(self)
@@ -363,6 +438,20 @@ class DNSShieldApp(tk.Tk):
             self.after(0, self._render_rules, rules_resp["result"])
 
     def _set_offline_state(self, detail_msg: str):
+        # Check if local adapters are trapped pointing to loopback while service is down
+        try:
+            from network_manager import NetworkManager
+            nm = NetworkManager()
+            health_check = nm.check_health(listener_port=53)
+            if health_check.get("needs_recovery"):
+                self.health_state.set("DEGRADED (DNS TRAPPED)")
+                self.health_detail.set("CRITICAL: Service is offline but adapters point to loopback! Name resolution failing.")
+                self.lbl_status_badge.config(fg=self.colors["red"])
+                self.btn_toggle_protection.config(text="Restore Network Now", state=tk.NORMAL)
+                return
+        except Exception:
+            pass
+
         self.health_state.set("SERVICE OFFLINE")
         self.health_detail.set(detail_msg)
         self.lbl_status_badge.config(fg=self.colors["red"])
@@ -440,25 +529,30 @@ class DNSShieldApp(tk.Tk):
     def _action_restore_network(self):
         confirm = messagebox.askyesno(
             "Restore Network Configuration",
-            "This will restore original DNS server addresses (e.g. DHCP) on all active adapters.\n\nProceed with emergency restoration?"
+            "This will restore original DNS server addresses on all active adapters and clean up filtering objects.\n\nProceed with emergency restoration?"
         )
         if not confirm:
             return
 
-        if not self.client:
-            # Fallback to local network_manager
-            from network_manager import NetworkManager
-            nm = NetworkManager()
-            res = nm.restore_dns()
-            messagebox.showinfo("Result", f"Restoration result: {res}")
-            return
+        # 1. If background service is alive and client has admin secret, try service IPC
+        if self.client and self.client.secret:
+            try:
+                resp = self.client.call("restore_network")
+                if resp.get("ok"):
+                    messagebox.showinfo("Success", "Original network adapter DNS settings successfully restored.")
+                    self._poll_status_and_events()
+                    return
+            except Exception as e:
+                logger.debug(f"Service IPC restore failed ({e}); falling back to standalone recovery.")
 
-        resp = self.client.call("restore_network")
-        if resp.get("ok"):
-            messagebox.showinfo("Success", "Original network adapter DNS settings successfully restored.")
+        # 2. Service is dead / unreachable / unelevated: execute standalone recovery without IPC!
+        res = execute_standalone_recovery()
+        if res.get("success"):
+            messagebox.showinfo("Success", "Network configuration restored successfully without contacting background service.")
             self._poll_status_and_events()
         else:
-            messagebox.showerror("Error", f"Restoration failed: {resp.get('error')}")
+            err = res.get("error") or "Unknown error"
+            messagebox.showerror("Restoration Failed", f"Could not restore network: {err}")
 
     def _action_add_block_rule(self):
         domain = self.entry_block_domain.get().strip().lower()

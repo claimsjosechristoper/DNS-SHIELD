@@ -2,8 +2,10 @@
 .SYNOPSIS
     DNS-SHIELD Emergency Network DNS Recovery Script.
 .DESCRIPTION
-    Restores all physical network adapters to original DHCP or static DNS addresses
-    from %ProgramData%\DNS-SHIELD\dns_backup.json, or resets adapters to DHCP if no backup exists.
+    Restores physical network adapters to original DNS settings while:
+    1. Preserving any later administrator changes (only touches adapters pointing to loopback).
+    2. Restoring exact static configurations without converting static adapters to DHCP.
+    3. Safely removing only DNS-SHIELD owned filtering objects.
 #>
 
 [CmdletBinding()]
@@ -24,6 +26,16 @@ if (Test-Path $BackupPath) {
         foreach ($prop in $Snapshot.PSObject.Properties) {
             $Alias = $prop.Name
             $Config = $prop.Value
+
+            # 1. Check if adapter current DNS points to loopback
+            $CurrentServers = (Get-DnsClientServerAddress -InterfaceAlias $Alias -ErrorAction SilentlyContinue).ServerAddresses
+            $HasLoopback = ($CurrentServers -contains "127.0.0.1") -or ($CurrentServers -contains "::1")
+
+            if (-not $HasLoopback -and $CurrentServers) {
+                Write-Host "[+] Preserving later administrator DNS configuration on '$Alias'. Skipping overwrite." -ForegroundColor Green
+                continue
+            }
+
             Write-Host "[*] Restoring adapter: $Alias" -ForegroundColor Yellow
 
             # Restore IPv4
@@ -57,22 +69,53 @@ if (Test-Path $BackupPath) {
         Remove-Item $BackupPath -Force
         Write-Host "[+] Recovery backup removed. Adapters restored successfully." -ForegroundColor Green
     } catch {
-        Write-Warning "[-] Error reading backup file: $_. Falling back to universal DHCP reset."
-        $FallbackDHCP = $true
+        Write-Warning "[-] Error reading backup file: $_. Attempting targeted adapter inspection."
+        $FallbackTargeted = $true
     }
 } else {
-    Write-Host "[!] No backup file found. Resetting active physical adapters to DHCP..." -ForegroundColor Yellow
-    $FallbackDHCP = $true
+    Write-Host "[!] No backup file found. Inspecting adapters for trapped loopback configuration..." -ForegroundColor Yellow
+    $FallbackTargeted = $true
 }
 
-if ($FallbackDHCP) {
+if ($FallbackTargeted) {
     $Adapters = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.Virtual -eq $false }
     foreach ($adapter in $Adapters) {
-        Write-Host "[*] Resetting adapter '$($adapter.Name)' to DHCP..." -ForegroundColor Yellow
-        netsh interface ipv4 set dnsservers name="$($adapter.Name)" source=dhcp | Out-Null
-        netsh interface ipv6 set dnsservers name="$($adapter.Name)" source=dhcp | Out-Null
+        $Alias = $adapter.Name
+        $CurrentServers = (Get-DnsClientServerAddress -InterfaceAlias $Alias -ErrorAction SilentlyContinue).ServerAddresses
+        $IsTrapped = ($CurrentServers -contains "127.0.0.1") -or ($CurrentServers -contains "::1")
+
+        if (-not $IsTrapped) {
+            Write-Host "[*] Adapter '$Alias' is not pointing to loopback. Preserving existing configuration." -ForegroundColor Gray
+            continue
+        }
+
+        # Check if IP assignment is DHCP
+        $IsDhcp = ((Get-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -ErrorAction SilentlyContinue).Dhcp -eq "Enabled")
+        if ($IsDhcp) {
+            Write-Host "[*] Trapped adapter '$Alias' uses DHCP: resetting DNS to DHCP..." -ForegroundColor Yellow
+            netsh interface ipv4 set dnsservers name="$Alias" source=dhcp | Out-Null
+            netsh interface ipv6 set dnsservers name="$Alias" source=dhcp | Out-Null
+        } else {
+            # Static IP: Preserve static configuration and set DNS to default gateway
+            $gw = (Get-NetRoute -InterfaceAlias $Alias -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object -First 1).NextHop
+            if ($gw -and $gw -ne "0.0.0.0") {
+                Write-Host "[*] Trapped adapter '$Alias' has STATIC IP. Preserving static configuration and setting DNS to gateway: $gw" -ForegroundColor Yellow
+                netsh interface ipv4 set dnsservers name="$Alias" source=static address="$gw" validate=no | Out-Null
+            } else {
+                Write-Host "[*] Trapped adapter '$Alias' has STATIC IP with no default gateway. Setting DNS to 1.1.1.1 fallback." -ForegroundColor Yellow
+                netsh interface ipv4 set dnsservers name="$Alias" source=static address="1.1.1.1" validate=no | Out-Null
+            }
+        }
     }
-    Write-Host "[+] All physical adapters reset to DHCP." -ForegroundColor Green
+}
+
+# Remove only owned DNS-SHIELD Firewall rules
+Write-Host "[*] Removing owned DNS-SHIELD firewall rules..."
+try {
+    Remove-NetFirewallRule -Name "DNSShield*" -ErrorAction SilentlyContinue | Out-Null
+    Write-Host "[+] DNS-SHIELD firewall rules removed." -ForegroundColor Green
+} catch {
+    Write-Warning "[-] Error removing firewall rules: $_"
 }
 
 # Flush DNS Cache

@@ -36,3 +36,25 @@ def test_service_runtime_stop_is_safe(tmp_path: Path):
     runtime = ServiceRuntime(tmp_path)
     runtime.stop()
     assert runtime.status()["state"] == "DISABLED"
+
+
+def test_health_degraded_when_routing_verified_but_listener_down():
+    """Confirms DEGRADED health when adapter routing points to loopback but listener is down."""
+    health = evaluate_health(
+        enabled=True,
+        listener_ready=False,
+        policy_ready=True,
+        upstream_ready=True,
+        routing_verified=True,
+    )
+    assert health.state is HealthState.DEGRADED
+    assert "incomplete" in health.detail.lower()
+
+
+def test_ipc_dispatch_apply_policy_requires_secret():
+    """Privileged apply_policy must be rejected without secret."""
+    req = {"operation": "apply_policy", "payload": {"version": 2}}
+    res = dispatch_request(None, req, {"apply_policy": lambda p: {"status": "ok"}})
+    assert res["ok"] is False
+    assert res["error"] == "privileged_secret_required"
+

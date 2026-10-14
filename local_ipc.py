@@ -1,4 +1,10 @@
-"""Authenticated, narrow local control protocol for the Windows service."""
+"""
+Authenticated, narrow local control protocol for the Windows service.
+
+Separates read-only status monitoring (accessible to unelevated interactive users)
+from privileged mutations (strictly requiring administrator HMAC-SHA256 authentication
+with replay protection, timestamp bounds, and message limits).
+"""
 
 import hashlib
 import hmac
@@ -6,24 +12,70 @@ import json
 import logging
 import secrets
 import threading
+import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Set, Tuple
 
 logger = logging.getLogger("DNSShield.IPC")
 
-ALLOWED_OPERATIONS = frozenset({
+# Maximum permitted payload size over IPC to prevent denial-of-service / memory exhaustion
+MAX_IPC_MESSAGE_SIZE = 65536  # 64 KB
+
+# Operations accessible to unelevated local users (Desktop UI monitoring)
+READ_ONLY_OPERATIONS = frozenset({
     "get_status",
     "get_events",
-    "set_enabled",
-    "diagnostics",
     "get_rules",
+    "get_network_state",
+    "diagnostics",
+})
+
+# Privileged operations requiring administrator HMAC-SHA256 authorization & replay protection
+PRIVILEGED_OPERATIONS = frozenset({
+    "set_enabled",
+    "restore_network",
     "add_rule",
     "delete_rule",
     "add_allowlist",
     "delete_allowlist",
-    "get_network_state",
-    "restore_network",
+    "apply_policy",
 })
+
+ALLOWED_OPERATIONS = READ_ONLY_OPERATIONS | PRIVILEGED_OPERATIONS
+
+# Replay protection threshold in seconds
+MAX_TIMESTAMP_SKEW_SECONDS = 60.0
+
+
+class ReplayCache:
+    """Thread-safe bounded cache of recent request nonces to prevent replay attacks."""
+
+    def __init__(self, ttl_seconds: float = MAX_TIMESTAMP_SKEW_SECONDS):
+        self.ttl = ttl_seconds
+        self._nonces: Dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def check_and_add(self, nonce: str, now: Optional[float] = None) -> bool:
+        """
+        Returns True if the nonce is valid and fresh (not replayed).
+        Returns False if the nonce was already used within the validity window.
+        """
+        if not nonce or len(nonce) < 8:
+            return False
+
+        current_time = now if now is not None else time.time()
+        with self._lock:
+            # Purge expired nonces
+            cutoff = current_time - (self.ttl * 2)
+            expired = [n for n, ts in self._nonces.items() if ts < cutoff]
+            for n in expired:
+                del self._nonces[n]
+
+            if nonce in self._nonces:
+                return False  # Replay detected
+
+            self._nonces[nonce] = current_time
+            return True
 
 
 def ensure_ipc_secret(path: Path) -> bytes:
@@ -42,36 +94,106 @@ def ensure_ipc_secret(path: Path) -> bytes:
     return secret
 
 
-def make_auth_token(secret: bytes, operation: str, payload: Any = None) -> str:
-    """Creates an HMAC-SHA256 signature for an operation and payload."""
+def make_auth_token(
+    secret: bytes,
+    operation: str,
+    payload: Any = None,
+    timestamp: Optional[float] = None,
+    nonce: Optional[str] = None,
+) -> str:
+    """Creates an HMAC-SHA256 signature for an operation, payload, timestamp, and nonce."""
+    msg_dict: Dict[str, Any] = {"operation": operation, "payload": payload}
+    if timestamp is not None:
+        msg_dict["timestamp"] = timestamp
+    if nonce is not None:
+        msg_dict["nonce"] = nonce
+
     message = json.dumps(
-        {"operation": operation, "payload": payload},
+        msg_dict,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
     return hmac.new(secret, message, hashlib.sha256).hexdigest()
 
 
-def authorize_request(secret: bytes, request: Dict[str, Any]) -> bool:
-    """Validates operation and HMAC-SHA256 authentication token."""
+def authorize_request_detail(
+    secret: Optional[bytes],
+    request: Dict[str, Any],
+    replay_cache: Optional[ReplayCache] = None,
+    now: Optional[float] = None,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Validates operation tier, message limits, replay protection, and HMAC signature.
+    Returns (is_authorized: bool, error_reason: Optional[str]).
+    """
     operation = request.get("operation")
     if operation not in ALLOWED_OPERATIONS:
-        return False
+        return False, "unknown_operation"
+
+    # Tier 1: Read-only monitoring operations are permitted for local unelevated UI
+    if operation in READ_ONLY_OPERATIONS:
+        return True, None
+
+    # Tier 2: Privileged mutations strictly require administrator HMAC authorization
+    if not secret:
+        return False, "privileged_secret_required"
+
     token = request.get("token")
-    if not isinstance(token, str):
-        return False
-    expected = make_auth_token(secret, operation, request.get("payload"))
-    return hmac.compare_digest(token, expected)
+    if not isinstance(token, str) or not token:
+        return False, "missing_token"
+
+    # Verify timestamp to prevent replay of old signed messages
+    ts = request.get("timestamp")
+    current_time = now if now is not None else time.time()
+
+    # Check for legacy token format (without timestamp/nonce) or modern replay-protected format
+    if ts is not None:
+        if not isinstance(ts, (int, float)):
+            return False, "invalid_timestamp"
+        if abs(current_time - float(ts)) > MAX_TIMESTAMP_SKEW_SECONDS:
+            return False, "expired_timestamp"
+
+        nonce = request.get("nonce")
+        if not isinstance(nonce, str) or len(nonce) < 8:
+            return False, "invalid_nonce"
+
+        if replay_cache is not None:
+            if not replay_cache.check_and_add(nonce, current_time):
+                return False, "replay_detected"
+
+        expected = make_auth_token(secret, operation, request.get("payload"), timestamp=float(ts), nonce=nonce)
+    else:
+        # Backward compatibility for direct callers: require exact payload HMAC
+        expected = make_auth_token(secret, operation, request.get("payload"))
+
+    if not hmac.compare_digest(token, expected):
+        return False, "unauthorized"
+
+    return True, None
+
+
+def authorize_request(
+    secret: Optional[bytes],
+    request: Dict[str, Any],
+    replay_cache: Optional[ReplayCache] = None,
+    now: Optional[float] = None,
+) -> bool:
+    """Validates request and returns boolean success for standard authorization checks."""
+    is_auth, _ = authorize_request_detail(secret, request, replay_cache, now)
+    return is_auth
 
 
 def dispatch_request(
-    secret: bytes,
+    secret: Optional[bytes],
     request: Dict[str, Any],
     handlers: Dict[str, Callable[[Any], Any]],
+    replay_cache: Optional[ReplayCache] = None,
 ) -> Dict[str, Any]:
     """Authorizes and dispatches an IPC request to registered handlers."""
-    if not authorize_request(secret, request):
-        return {"ok": False, "error": "unauthorized"}
+    is_auth, err_msg = authorize_request_detail(secret, request, replay_cache)
+    if not is_auth:
+        return {"ok": False, "error": err_msg or "unauthorized"}
+
     operation = request["operation"]
     handler = handlers.get(operation)
     if handler is None:
@@ -86,11 +208,16 @@ def dispatch_request(
 
 def encode_request(request: Dict[str, Any]) -> bytes:
     """Serializes a request dictionary into newline-terminated UTF-8 JSON."""
-    return (json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8")
+    encoded = (json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8")
+    if len(encoded) > MAX_IPC_MESSAGE_SIZE:
+        raise ValueError(f"Serialized request exceeds maximum permitted size of {MAX_IPC_MESSAGE_SIZE} bytes")
+    return encoded
 
 
 def decode_request(data: bytes) -> Dict[str, Any]:
-    """Deserializes UTF-8 JSON request bytes into a dictionary."""
+    """Deserializes UTF-8 JSON request bytes into a dictionary with size enforcement."""
+    if len(data) > MAX_IPC_MESSAGE_SIZE:
+        raise ValueError(f"IPC request data exceeds maximum limit of {MAX_IPC_MESSAGE_SIZE} bytes")
     text = data.decode("utf-8").strip()
     if not text:
         raise ValueError("Empty request")
@@ -105,9 +232,10 @@ class NamedPipeServer:
 
     PIPE_NAME = r"\\.\pipe\DNSShield"
 
-    def __init__(self, secret: bytes, handlers: Dict[str, Callable[[Any], Any]]):
+    def __init__(self, secret: Optional[bytes], handlers: Dict[str, Callable[[Any], Any]]):
         self.secret = secret
         self.handlers = handlers
+        self.replay_cache = ReplayCache()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="DNSShield-IPC", daemon=True)
 
@@ -128,7 +256,8 @@ class NamedPipeServer:
             logger.error("win32 modules not available for NamedPipeServer")
             return
 
-        # Explicit Security Descriptor: SYSTEM and Administrators full access; Interactive Users read/write
+        # Security Descriptor: SYSTEM (SY) and Administrators (BA) Full Access; Interactive Users (IU) Read/Write
+        # Network users (NU) have NO access.
         sd = win32security.ConvertStringSecurityDescriptorToSecurityDescriptor(
             "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)",
             win32security.SDDL_REVISION_1,
@@ -142,16 +271,20 @@ class NamedPipeServer:
                 win32pipe.PIPE_ACCESS_DUPLEX,
                 win32pipe.PIPE_TYPE_BYTE | win32pipe.PIPE_READMODE_BYTE | win32pipe.PIPE_WAIT,
                 win32pipe.PIPE_UNLIMITED_INSTANCES,
-                65536,
-                65536,
+                MAX_IPC_MESSAGE_SIZE,
+                MAX_IPC_MESSAGE_SIZE,
                 1000,
                 attributes,
             )
             try:
                 win32pipe.ConnectNamedPipe(pipe, None)
-                _, data = win32file.ReadFile(pipe, 65536)
+                _, data = win32file.ReadFile(pipe, MAX_IPC_MESSAGE_SIZE)
                 if data:
-                    response = dispatch_request(self.secret, decode_request(data), self.handlers)
+                    try:
+                        req_obj = decode_request(data)
+                        response = dispatch_request(self.secret, req_obj, self.handlers, self.replay_cache)
+                    except ValueError as ve:
+                        response = {"ok": False, "error": str(ve)}
                     win32file.WriteFile(pipe, encode_request(response))
                 try:
                     win32pipe.DisconnectNamedPipe(pipe)
@@ -167,23 +300,41 @@ class NamedPipeServer:
 class NamedPipeClient:
     """Client for local authenticated IPC over Windows named pipe."""
 
-    def __init__(self, secret: bytes, pipe_name: str = NamedPipeServer.PIPE_NAME):
+    def __init__(self, secret: Optional[bytes] = None, pipe_name: str = NamedPipeServer.PIPE_NAME):
         self.secret = secret
         self.pipe_name = pipe_name
 
     def call(self, operation: str, payload: Any = None, timeout_s: float = 3.0) -> Dict[str, Any]:
-        """Calls a named pipe operation with HMAC token and returns parsed response."""
-        token = make_auth_token(self.secret, operation, payload)
-        req = {
+        """Calls a named pipe operation with appropriate tier authorization and replay token."""
+        req: Dict[str, Any] = {
             "operation": operation,
             "payload": payload,
-            "token": token
         }
-        req_bytes = encode_request(req)
+
+        # If calling a privileged mutation, generate replay-protected token
+        if operation in PRIVILEGED_OPERATIONS:
+            if not self.secret:
+                return {
+                    "ok": False,
+                    "error": "Administrative elevation required: privileged secret not accessible to unelevated process."
+                }
+            now = time.time()
+            nonce = secrets.token_hex(16)
+            token = make_auth_token(self.secret, operation, payload, timestamp=now, nonce=nonce)
+            req["timestamp"] = now
+            req["nonce"] = nonce
+            req["token"] = token
+        elif self.secret:
+            # Optionally attach token for read-only operations if secret is available
+            req["token"] = make_auth_token(self.secret, operation, payload)
+
+        try:
+            req_bytes = encode_request(req)
+        except ValueError as ve:
+            return {"ok": False, "error": str(ve)}
 
         try:
             import win32file
-            import win32pipe
 
             handle = win32file.CreateFile(
                 self.pipe_name,
@@ -196,7 +347,7 @@ class NamedPipeClient:
             )
             try:
                 win32file.WriteFile(handle, req_bytes)
-                _, resp_bytes = win32file.ReadFile(handle, 65536)
+                _, resp_bytes = win32file.ReadFile(handle, MAX_IPC_MESSAGE_SIZE)
                 return json.loads(resp_bytes.decode("utf-8").strip())
             finally:
                 win32file.CloseHandle(handle)

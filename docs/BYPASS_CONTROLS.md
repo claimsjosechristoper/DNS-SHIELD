@@ -18,21 +18,22 @@ A local DNS filtering service that only listens on loopback is vulnerable to sev
 
 ## 2. Windows Firewall Controls
 
-DNS-SHIELD defines the following outbound Windows Filtering rules (managed via `firewall_manager.py`):
+DNS-SHIELD defines the following outbound Windows Filtering architecture (managed via `firewall_manager.py`):
 
-| Rule Name | Protocol | Remote Port | Program | Action | Purpose |
+| Rule / Filter Name | Protocol | Remote Port | Target / Scope | Action | Purpose |
 |---|---|---|---|---|---|
-| `DNSShield-Allow-Service-Outbound-DNS` | UDP / TCP | 53 | `%ProgramFiles%\DNS-SHIELD\DNSShieldService.exe` | **ALLOW** | Permits DNS-SHIELD service to query approved upstreams. |
-| `DNSShield-Block-Direct-Outbound-DNS-UDP` | UDP | 53 | Any | **BLOCK** | Prevents rogue processes from querying external resolvers over UDP. |
-| `DNSShield-Block-Direct-Outbound-DNS-TCP` | TCP | 53 | Any | **BLOCK** | Prevents rogue processes from querying external resolvers over TCP. |
-| `DNSShield-Block-Direct-Outbound-DoT-TCP` | TCP | 853 | Any | **BLOCK** | Blocks standard DNS-over-TLS endpoints. |
-| `DNSShield-Block-Direct-Outbound-DoQ-UDP` | UDP | 853 | Any | **BLOCK** | Blocks standard DNS-over-QUIC endpoints. |
+| `DNSShield_WFP_Block_Rogue_Port53_IPv4` | UDP / TCP | 53 | Non-gateway processes (`ALE_APP_ID != DNSShieldService.exe`) | **BLOCK** | Prevents rogue processes from querying external resolvers while preserving gateway upstream access. |
+| `DNSShield_WFP_Block_Rogue_Port53_IPv6` | UDP / TCP | 53 | Non-gateway processes (`ALE_APP_ID != DNSShieldService.exe`) | **BLOCK** | Dual-stack IPv6 rogue query blocking. |
+| `DNSShield-Block-Direct-DoT-TCP` | TCP | 853 | System-wide | **BLOCK** | Blocks direct outbound DNS-over-TLS endpoints. |
+| `DNSShield-Block-Direct-DoQ-UDP` | UDP | 853 | System-wide | **BLOCK** | Blocks direct outbound DNS-over-QUIC endpoints. |
 
-### Windows Firewall Precedence Notes
+### Windows Filtering & Precedence Architecture
 In Windows Defender Firewall with Advanced Security:
-- Outbound block rules take precedence over outbound allow rules unless explicitly scoped.
-- Scoping outbound port 53 block rules with an application exception allows the DNS-SHIELD service binary to connect outbound while all other executables are blocked from direct port 53 traffic.
-- Rollback command: `netsh advfirewall firewall delete rule name="DNSShield-*"`
+- **Block Rule Precedence:** Outbound BLOCK rules unconditionally override ordinary program-specific Outbound ALLOW rules. A naive global port-53 block rule will drop the gateway's own upstream packets if the gateway communicates via port 53.
+- **Supported Solution (WFP ALE Layer):** Windows Filtering Platform (WFP) Application Layer Enforcement (`FWPM_LAYER_ALE_AUTH_CONNECT_V4` and `V6`) filters evaluate process identity atomically (`FWPM_CONDITION_ALE_APP_ID != service_path`), permitting the service to reach external resolvers while blocking all other programs.
+- **Alternative Supported Approach:** Encrypted upstream isolation (DoH over port 443) or scoped remote IP NetFirewall rules.
+- **Current Status:** **PENDING_INTEGRATION_VERIFICATION**. Live firewall mutation is kept in dry-run mode on the host laptop and must be validated on a disposable Windows VM before activation.
+- Rollback command: `Remove-NetFirewallRule -Name "DNSShield-*" -ErrorAction SilentlyContinue`
 
 ---
 

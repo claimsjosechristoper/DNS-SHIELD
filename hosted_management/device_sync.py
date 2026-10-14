@@ -132,3 +132,35 @@ class DeviceSyncAgent:
         except Exception as exc:
             logger.debug(f"Telemetry flush delayed: {exc}")
         return 0
+
+    def fetch_and_apply_policy(
+        self,
+        verifier: Any,
+        apply_callback: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Fetches current signed policy from cloud, verifies it, and triggers activation callback."""
+        if not self.is_enrolled():
+            return {"status": "error", "error": "Device is not enrolled"}
+
+        url = f"{self.cloud_url}/api/v1/policies?tenant_id={verifier.expected_tenant_id}"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "X-Device-Id": self.device_id,
+                "X-Device-Key": self.device_key,
+            }
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10.0) as resp:
+                if resp.status == 200:
+                    policy_data = json.loads(resp.read().decode("utf-8"))
+                    result = verifier.verify_and_process(policy_data)
+                    if result.get("action") == "activate":
+                        self.last_policy_version = result["version"]
+                        if apply_callback:
+                            apply_callback(result)
+                    return result
+        except Exception as exc:
+            logger.error(f"Failed to fetch or verify policy: {exc}")
+            return {"status": "error", "error": str(exc)}
+        return {"status": "error", "error": "Unknown failure"}

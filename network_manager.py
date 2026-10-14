@@ -239,24 +239,101 @@ class NetworkManager:
             self.restore_dns()
             return {"success": False, "error": f"Configuration failed, changes rolled back: {exc}"}
 
+    def _is_adapter_ip_dhcp(self, alias: str) -> bool:
+        """Determines if the network adapter's IP address assignment is DHCP (vs. static)."""
+        if os.name != "nt":
+            return True
+        cmd = f"(Get-NetIPInterface -InterfaceAlias '{alias}' -AddressFamily IPv4 -ErrorAction SilentlyContinue).Dhcp"
+        try:
+            res = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", cmd],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False
+            )
+            return res.stdout.strip().lower() == "enabled"
+        except Exception:
+            return True
+
+    def _get_adapter_gateway(self, alias: str) -> Optional[str]:
+        """Queries the default gateway IP for an adapter."""
+        if os.name != "nt":
+            return "1.1.1.1"
+        cmd = f"(Get-NetRoute -InterfaceAlias '{alias}' -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object -First 1).NextHop"
+        try:
+            res = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", cmd],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False
+            )
+            gw = res.stdout.strip()
+            return gw if gw and gw != "0.0.0.0" else None
+        except Exception:
+            return None
+
     def restore_dns(self) -> Dict[str, Any]:
         """
-        Restores original adapter configurations from snapshot.
+        Restores original adapter configurations while:
+        1. Preserving any later administrator changes (does not touch adapters not pointing to loopback).
+        2. Restoring exact static DNS servers for static adapters (does NOT default all adapters to DHCP).
+        3. Restoring DHCP only for adapters that were originally DHCP.
         """
+        restored = []
+        errors = []
+
         if not self.backup_path.exists():
-            return {"success": True, "restored": [], "message": "No active backup found; adapters already in default state."}
+            # No backup snapshot on disk: check for any adapters trapped pointing to loopback
+            adapters = self.get_active_physical_adapters()
+            trapped = []
+            for a in adapters:
+                alias = a["alias"]
+                cfg = self.get_adapter_dns_config(alias)
+                if cfg and any(s in ("127.0.0.1", "::1") for s in (cfg.ipv4_servers + cfg.ipv6_servers)):
+                    trapped.append(alias)
+
+            if not trapped:
+                return {"success": True, "restored": [], "message": "No active backup found; no adapters pointing to loopback."}
+
+            logger.warning(f"No backup file found, but adapters {trapped} point to loopback. Performing targeted recovery...")
+            for alias in trapped:
+                try:
+                    if self._is_adapter_ip_dhcp(alias):
+                        logger.info(f"Adapter '{alias}' is DHCP-enabled: resetting DNS to DHCP.")
+                        subprocess.run(["netsh.exe", "interface", "ipv4", "set", "dnsservers", f"name={alias}", "source=dhcp"], check=False)
+                        subprocess.run(["netsh.exe", "interface", "ipv6", "set", "dnsservers", f"name={alias}", "source=dhcp"], check=False)
+                        restored.append(f"{alias} (DHCP reset)")
+                    else:
+                        gw = self._get_adapter_gateway(alias) or "1.1.1.1"
+                        logger.warning(f"Adapter '{alias}' has STATIC IP! Preserving static configuration and setting DNS to gateway {gw}.")
+                        subprocess.run(["netsh.exe", "interface", "ipv4", "set", "dnsservers", f"name={alias}", "source=static", f"address={gw}", "validate=no"], check=False)
+                        restored.append(f"{alias} (static gateway {gw})")
+                except Exception as exc:
+                    errors.append(f"Error recovering {alias}: {exc}")
+
+            return {"success": len(errors) == 0, "restored": restored, "errors": errors}
 
         try:
             snapshot = json.loads(self.backup_path.read_text(encoding="utf-8"))
         except Exception as exc:
             return {"success": False, "error": f"Failed to parse recovery snapshot: {exc}"}
 
-        restored = []
-        errors = []
-
         for alias, cfg in snapshot.items():
             try:
-                # Restore IPv4
+                # 1. Preserve later administrator changes:
+                # If current DNS configuration does not point to loopback, the administrator
+                # or network policy has already reconfigured it. Do NOT overwrite it!
+                current_cfg = self.get_adapter_dns_config(alias)
+                if current_cfg:
+                    has_loopback = any(s in ("127.0.0.1", "::1") for s in (current_cfg.ipv4_servers + current_cfg.ipv6_servers))
+                    if not has_loopback:
+                        logger.info(f"Preserving administrator DNS change on adapter '{alias}'. Skipping restore.")
+                        restored.append(f"{alias} (admin changes preserved)")
+                        continue
+
+                # 2. Restore IPv4 according to original state
                 if cfg.get("ipv4_dhcp", True) or not cfg.get("ipv4_servers"):
                     subprocess.run(
                         ["netsh.exe", "interface", "ipv4", "set", "dnsservers", f"name={alias}", "source=dhcp"],
@@ -277,7 +354,7 @@ class NetworkManager:
                             check=False
                         )
 
-                # Restore IPv6
+                # 3. Restore IPv6 according to original state
                 if cfg.get("ipv6_dhcp", True) or not cfg.get("ipv6_servers"):
                     subprocess.run(
                         ["netsh.exe", "interface", "ipv6", "set", "dnsservers", f"name={alias}", "source=dhcp"],
@@ -322,9 +399,63 @@ class NetworkManager:
             cfg = self.get_adapter_dns_config(alias)
             if not cfg:
                 continue
-            # Check if 127.0.0.1 or ::1 is in configured servers
             has_loopback = any(s in ("127.0.0.1", "::1") for s in (cfg.ipv4_servers + cfg.ipv6_servers))
             if not has_loopback:
                 return False, f"Adapter '{alias}' is not pointing to DNS-SHIELD loopback."
 
         return True, "Active physical adapters successfully routed to local DNS-SHIELD."
+
+    def check_health(self, listener_port: int = 53) -> Dict[str, Any]:
+        """
+        Diagnoses listener responsiveness vs. adapter routing state.
+        Accurately reports DEGRADED if adapter DNS is trapped pointing
+        to loopback while listener port 53 is down.
+        """
+        listener_alive = False
+        # Probing via UDP DNS query probe
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(0.2)
+            probe_packet = b"\xaa\xbb\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x01"
+            sock.sendto(probe_packet, ("127.0.0.1", listener_port))
+            data, _ = sock.recvfrom(512)
+            if data and len(data) >= 12:
+                listener_alive = True
+            sock.close()
+        except Exception:
+            # Fallback check via TCP connection attempt
+            try:
+                st = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                st.settimeout(0.2)
+                st.connect(("127.0.0.1", listener_port))
+                listener_alive = True
+                st.close()
+            except Exception:
+                listener_alive = False
+
+        routed, routing_msg = self.verify_routing()
+
+        if routed and not listener_alive:
+            return {
+                "state": "DEGRADED",
+                "detail": "CRITICAL: Adapters point to 127.0.0.1 but DNS listener is dead/unresponsive! Name resolution failing.",
+                "listener_alive": False,
+                "routing_verified": True,
+                "needs_recovery": True,
+            }
+        elif routed and listener_alive:
+            return {
+                "state": "PROTECTED",
+                "detail": "Active and protecting: Adapters routed to responsive local DNS-SHIELD resolver.",
+                "listener_alive": True,
+                "routing_verified": True,
+                "needs_recovery": False,
+            }
+        else:
+            return {
+                "state": "UNPROTECTED",
+                "detail": routing_msg,
+                "listener_alive": listener_alive,
+                "routing_verified": False,
+                "needs_recovery": False,
+            }
