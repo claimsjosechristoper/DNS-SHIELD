@@ -367,7 +367,11 @@ def build():
     print(f"  Service Executable: {service_exe if service_exe.exists() else 'N/A'}")
     print(f"  App Executable:     {app_exe if app_exe.exists() else 'N/A'}")
     print(f"  Installer Status:   {manifest['installer']['status']}")
-    if manifest['installer']['blocker']:
+    if manifest['installer'].get('path'):
+        print(f"  Installer Output:   {manifest['installer']['path']}")
+        print(f"  Installer SHA-256:  {manifest['installer']['sha256']}")
+        print(f"  Installer Signing:  {manifest['installer']['signing_status']}")
+    if manifest['installer'].get('blocker'):
         print(f"  Installer Blocker:  {manifest['installer']['blocker']}")
     print("==========================================================")
 
