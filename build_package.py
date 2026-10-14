@@ -213,6 +213,14 @@ def build():
         for f in src_blocklists.glob("*.txt"):
             shutil.copy(f, data_dir / f.name)
 
+    # Copy recovery and evidence scripts to dist/scripts
+    dist_scripts = DIST_DIR / "scripts"
+    dist_scripts.mkdir(parents=True, exist_ok=True)
+    for s in ["recovery.ps1", "collect_vm_evidence.ps1"]:
+        src_s = BASE_DIR / "scripts" / s
+        if src_s.exists():
+            shutil.copy(src_s, dist_scripts / s)
+
     # 4. Hash Executables
     print("\n[*] Calculating artifact hashes...")
     service_exe = service_dist / "DNSShieldService.exe"
@@ -236,7 +244,42 @@ def build():
         }
         print(f"    DNSShieldApp.exe:     {h_app} ({app_exe.stat().st_size} bytes)")
 
-    # 5. Inno Setup Compilation Check
+    # 5. Assemble Disposable VM Test Package
+    print("\n[*] Assembling Disposable VM Test Package in dist/vm_test_package/...")
+    vm_pkg_dir = DIST_DIR / "vm_test_package"
+    if vm_pkg_dir.exists():
+        shutil.rmtree(vm_pkg_dir)
+    vm_pkg_dir.mkdir(parents=True, exist_ok=True)
+
+    # Copy service & app dists
+    if service_dist.exists():
+        shutil.copytree(service_dist, vm_pkg_dir / "DNSShieldService")
+    if (DIST_DIR / "DNSShieldApp").exists():
+        shutil.copytree(DIST_DIR / "DNSShieldApp", vm_pkg_dir / "DNSShieldApp")
+
+    # Copy scripts
+    (vm_pkg_dir / "scripts").mkdir(parents=True, exist_ok=True)
+    for s in ["recovery.ps1", "collect_vm_evidence.ps1"]:
+        src_s = BASE_DIR / "scripts" / s
+        if src_s.exists():
+            shutil.copy(src_s, vm_pkg_dir / "scripts" / s)
+
+    # Copy docs & runbook
+    (vm_pkg_dir / "docs").mkdir(parents=True, exist_ok=True)
+    for doc in ["DISPOSABLE_VM_TEST_PROCEDURE.md", "RECOVERY_INSTRUCTIONS.md"]:
+        src_doc = BASE_DIR / "docs" / doc
+        if src_doc.exists():
+            shutil.copy(src_doc, vm_pkg_dir / "docs" / doc)
+
+    # Copy installer script
+    (vm_pkg_dir / "installer").mkdir(parents=True, exist_ok=True)
+    src_iss = BASE_DIR / "installer" / "DNS-SHIELD-Setup.iss"
+    if src_iss.exists():
+        shutil.copy(src_iss, vm_pkg_dir / "installer" / "DNS-SHIELD-Setup.iss")
+
+    print(f"[+] VM test package staged at: {vm_pkg_dir}")
+
+    # 6. Inno Setup Compilation Check
     print("\n[4/4] Checking for Inno Setup Compiler (ISCC.exe)...")
     iscc_path: Optional[Path] = None
     if ISCC_DEFAULT_PATH.exists():
@@ -262,17 +305,27 @@ def build():
             setup_exe = DIST_DIR / "DNS-SHIELD-Setup-x64.exe"
             if setup_exe.exists():
                 h_setup = compute_sha256(setup_exe)
+                # Check Authenticode signature
+                sig_res = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", f"(Get-AuthenticodeSignature '{setup_exe}').Status.ToString()"],
+                    capture_output=True, text=True
+                )
+                sig_status = sig_res.stdout.strip() or "UNKNOWN"
                 manifest["installer"] = {
                     "status": "COMPILED",
                     "path": str(setup_exe),
                     "size_bytes": setup_exe.stat().st_size,
-                    "sha256": h_setup
+                    "sha256": h_setup,
+                    "signing_status": sig_status,
                 }
-                print(f"[+] Installer created: {setup_exe} (SHA-256: {h_setup})")
+                # Also copy installer into vm_pkg_dir
+                shutil.copy(setup_exe, vm_pkg_dir / "installer" / "DNS-SHIELD-Setup-x64.exe")
+                print(f"[+] Installer created: {setup_exe} (SHA-256: {h_setup}, Signing: {sig_status})")
         else:
             manifest["installer"] = {
                 "status": "COMPILATION_FAILED",
-                "blocker": f"ISCC exited with code {step3['exit_code']}: {step3['stderr']}"
+                "blocker": f"ISCC exited with code {step3['exit_code']}: {step3['stderr']}",
+                "signing_status": "NOT_APPLICABLE"
             }
             print(f"[-] Inno Setup compilation failed: {step3['stderr']}")
     else:
@@ -280,10 +333,18 @@ def build():
         manifest["installer"] = {
             "status": "COMPILER_UNAVAILABLE",
             "blocker": blocker_msg,
-            "required_command": f'& "{ISCC_DEFAULT_PATH}" "installer\\DNS-SHIELD-Setup.iss"'
+            "setup_instructions": {
+                "winget_command": "winget install --id JRSoftware.InnoSetup -e",
+                "manual_url": "https://jrsoftware.org/isdl.php",
+                "compilation_command": f'& "{ISCC_DEFAULT_PATH}" "installer\\DNS-SHIELD-Setup.iss"'
+            },
+            "path": None,
+            "sha256": None,
+            "signing_status": "NOT_COMPILED"
         }
         print(f"[-] {blocker_msg}")
         print("    Installer compilation skipped. PyInstaller binaries are ready in dist/.")
+        print(f"    To install Inno Setup: winget install --id JRSoftware.InnoSetup -e")
 
     # Save Build Manifest
     manifest_path = DIST_DIR / "build_manifest.json"
