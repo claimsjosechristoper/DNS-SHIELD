@@ -28,9 +28,11 @@ OutputBaseFilename=DNS-SHIELD-Setup-x64
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
-; Strict elevation: installer must run elevated; users cannot override to unprivileged paths
+; Strict elevation: installer must run elevated
 PrivilegesRequired=admin
-PrivilegesRequiredOverridesAllowed=none
+; PrivilegesRequiredOverridesAllowed=none (Inno Setup directive below enforces no overrides)
+PrivilegesRequiredOverridesAllowed=
+SourceDir=..
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -61,7 +63,7 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\app\{#MyAppExeName}"; Tasks
 
 [Run]
 ; Upgrade & Installation: Stop existing service if running, configure quoted binPath, set recovery actions, and start
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""$bin = '\"\"\"\"{app}\service\{#MyServiceExeName}\"\"\"'; $svc = Get-Service -Name DNSShield -ErrorAction SilentlyContinue; if ($svc) { Stop-Service DNSShield -Force -ErrorAction SilentlyContinue; sc.exe config DNSShield binPath= $bin start= auto DisplayName= 'DNS-SHIELD DNS Protection' } else { sc.exe create DNSShield binPath= $bin start= auto DisplayName= 'DNS-SHIELD DNS Protection' }; Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\DNSShield' -Name ImagePath -Value $bin -Force"""; Flags: runhidden
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""$bin = '""""{app}\service\{#MyServiceExeName}""""'; $svc = Get-Service -Name DNSShield -ErrorAction SilentlyContinue; if ($svc) {{{{ Stop-Service DNSShield -Force -ErrorAction SilentlyContinue; sc.exe config DNSShield binPath= $bin start= auto DisplayName= 'DNS-SHIELD DNS Protection' }}}} else {{{{ sc.exe create DNSShield binPath= $bin start= auto DisplayName= 'DNS-SHIELD DNS Protection' }}}}; Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\DNSShield' -Name ImagePath -Value $bin -Force"""; Flags: runhidden
 Filename: "{sys}\sc.exe"; Parameters: "description DNSShield ""Local deterministic DNS filtering background service."""; Flags: runhidden
 Filename: "{sys}\sc.exe"; Parameters: "failure DNSShield reset= 86400 actions= restart/60000/restart/60000/restart/60000"; Flags: runhidden
 Filename: "{sys}\sc.exe"; Parameters: "start DNSShield"; Flags: runhidden

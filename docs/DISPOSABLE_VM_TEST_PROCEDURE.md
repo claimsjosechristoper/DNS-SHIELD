@@ -1,28 +1,32 @@
 # DNS-SHIELD: Disposable Windows VM Integration Validation Runbook
 
-**Document Revision:** 4.0  
+**Document Revision:** 5.0  
 **Target Environment:** Clean Disposable Windows 11 x64 (22H2 / 23H2 / 24H2) Virtual Machine  
 **Controlled Upstream Host:** Linux/BSD host with root access running `tcpdump` and a test resolver.  
+**Self-Containment Guarantee:** Operates strictly using packaged binaries (`DNSShieldService.exe`, `DNSShieldApp.exe`, `recovery.ps1`). **No Python installation or repository source files required on the test VM.**  
 **Safety Notice:** Run strictly inside a disposable VM. Never execute protection activation or network mutations on host developer workstations.
 
 ---
 
 ## 1. Required Files Inventory & VM Staging
 
-Ensure the following files are staged inside the VM directory `C:\TestPackage\`:
+Ensure the following files from the release package are staged inside the VM directory `C:\TestPackage\`:
 
 ```text
 C:\TestPackage\
-├── DNSShieldService\              # PyInstaller service build directory
+├── installer\
+│   └── DNS-SHIELD-Setup-x64.exe   # Compiled Inno Setup installer package
+├── DNSShieldService\              # Packaged service binary & administrative CLI
 │   ├── DNSShieldService.exe
-│   └── data\blocklists\           # Bundled blocklist text files
-├── DNSShieldApp\                  # PyInstaller desktop application directory
+│   └── data\blocklists\           # Bundled blocklists
+├── DNSShieldApp\                  # Packaged desktop GUI control center
 │   └── DNSShieldApp.exe
 ├── scripts\
-│   └── recovery.ps1               # Standalone emergency network recovery script
-├── installer\
-│   └── DNS-SHIELD-Setup-x64.exe   # Inno Setup installer package (when compiled)
-└── baseline_dns.xml               # Generated in Step 2.1
+│   ├── recovery.ps1               # Standalone emergency network recovery script
+│   └── collect_vm_evidence.ps1    # Automated diagnostic snapshot script
+└── docs\
+    ├── DISPOSABLE_VM_TEST_PROCEDURE.md
+    └── RECOVERY_INSTRUCTIONS.md
 ```
 
 ---
@@ -49,7 +53,7 @@ On the external upstream server (e.g., `192.168.100.1`), capture **both UDP and 
 # Real-time monitoring terminal:
 sudo tcpdump -i any -n -v "(udp or tcp) port 53 and host <VM_IP_ADDRESS>" -l
 
-# Background capture file for unambiguous post-test packet correlation:
+# Background capture file for post-test packet correlation:
 sudo tcpdump -i any -n "(udp or tcp) port 53 and host <VM_IP_ADDRESS>" -w /tmp/upstream_capture.pcap
 ```
 
@@ -78,14 +82,15 @@ Test-NetConnection -ComputerName ::1 -Port 53
 
 ## 4. Explicit Protection Activation & System Verification
 
-*Note: Simply starting the service binary does not mutate network adapters until protection is explicitly enabled.*
+*Note: Starting the service binary does not mutate network adapters until protection is explicitly enabled.*
 
-### Step 4.1: Explicitly Enable Protection
+### Step 4.1: Explicitly Enable Protection (No Python Required)
 ```powershell
-# Enable protection via NetworkManager
-python -c "from network_manager import NetworkManager; nm = NetworkManager(); res = nm.enable_protection(); print(res)"
+# Method A: Using the Packaged Administrative CLI (Reads credentials internally; no command-line secret)
+& "C:\TestPackage\DNSShieldService\DNSShieldService.exe" cli enable-protection
 
-# Or launch GUI as Administrator and click 'Enable Protection':
+# Method B: Using the Packaged Desktop Application GUI
+# Launch GUI as Administrator and click 'Enable Protection':
 Start-Process -FilePath "C:\TestPackage\DNSShieldApp\DNSShieldApp.exe"
 ```
 
@@ -100,7 +105,13 @@ Get-DnsClientServerAddress -AddressFamily IPv6 | Where-Object { $_.ServerAddress
 # 3. Export and inspect active WFP filters
 netsh wfp show filters file="C:\TestPackage\wfp_filters.xml"
 [xml]$wfp = Get-Content "C:\TestPackage\wfp_filters.xml"
-$dnsFilters = $wfp.wfpdiag.filters.filter | Where-Object { $_.displayData.name -like "*DNSShield*" -or $_.displayData.name -like "*IPv4_Permit*" -or $_.displayData.name -like "*IPv4_Block*" }
+$dnsFilters = $wfp.wfpdiag.filters.filter | Where-Object { 
+    $_.displayData.name -like "*DNSShield*" -or 
+    $_.displayData.name -like "*IPv4_Permit*" -or 
+    $_.displayData.name -like "*IPv4_Block*" -or
+    $_.displayData.name -like "*IPv6_Permit*" -or
+    $_.displayData.name -like "*IPv6_Block*"
+}
 $dnsFilters | Select-Object filterId, @{N='Name';E={$_.displayData.name}}, action | Format-Table -AutoSize
 # Expected: 8 filters registered under DNS-SHIELD sublayer
 ```
@@ -109,93 +120,93 @@ $dnsFilters | Select-Object filterId, @{N='Name';E={$_.displayData.name}}, actio
 
 ## 5. Policy Configuration: Supported Interface & Active Engine Verification
 
-Add the controlled blocked domain `malware-sample.test` through the **supported administrative policy interface** (not raw SQLite writes) and verify that the active running engine has loaded it.
+Add the controlled blocked domain `malware-sample.test` through the **supported administrative interface** without passing secrets on the process command line.
 
-### Step 5.1: Add Block Rule via Supported IPC / GUI
+### Step 5.1: Add Block Rule via Packaged CLI or GUI
 ```powershell
-# Method A: Via Supported Named Pipe IPC (PowerShell)
-$secret = (Get-Content "$env:ProgramData\DNS-SHIELD\ipc.secret").Trim()
-python -c "from local_ipc import NamedPipeClient; c = NamedPipeClient(secret=b'$secret'); res = c.call('add_rule', {'domain': 'malware-sample.test', 'rule_type': 'subdomain', 'reason': 'Controlled Integration Test Domain'}); print('add_rule result:', res)"
+# Method A: Packaged Administrative CLI (Reads %ProgramData%\DNS-SHIELD\ipc.secret internally)
+& "C:\TestPackage\DNSShieldService\DNSShieldService.exe" cli add-rule malware-sample.test subdomain "Controlled Integration Test Domain"
 
-# Method B: Via Desktop Application
-# Open GUI -> Navigate to 'Custom Block Rules' tab -> Enter 'malware-sample.test' -> Click 'Add Block Rule'
+# Method B: Desktop Application GUI
+# Open GUI -> Click 'Custom Block Rules' tab -> Enter 'malware-sample.test' -> Click 'Add Block Rule'
 ```
 
 ### Step 5.2: Verify the Running Engine Loaded the Rule
-Query active rules from the running engine via IPC and assert in-memory presence:
+Query active in-memory rules via the packaged CLI:
 
 ```powershell
-python -c "from local_ipc import NamedPipeClient; c = NamedPipeClient(); res = c.call('get_rules'); rules = [r['domain'] for r in res.get('data', {}).get('custom_rules', [])]; assert 'malware-sample.test' in rules, 'Rule not found in active engine!'; print('[PASS] Running engine confirmed loaded rule:', rules)"
+& "C:\TestPackage\DNSShieldService\DNSShieldService.exe" cli get-rules
+# Expected JSON output includes: "domain": "malware-sample.test"
 ```
 
 ---
 
 ## 6. Multi-Point Correlated Resolution Verification
 
-A local gateway log alone is not proof of blocking. We correlate three observation points:
-1. **Client Observation:** Client receives the actual blocking response (`REFUSED`).
-2. **Gateway Observation:** Gateway logs decision `BLOCK`, type `ADMIN_POLICY`, matched rule.
-3. **Upstream Observation:** Controlled upstream receives **zero queries** for the blocked domain (UDP & TCP).
+We correlate three distinct observation points:
+1. **Client Observation:** Known IP for allowed queries; explicit RFC `REFUSED` response for blocked queries.
+2. **Gateway Observation:** Local audit table `dns_logs` records decision, rule, and timestamps.
+3. **Upstream Observation:** Controlled upstream receives allowed queries, and **exactly zero queries** for blocked probes (UDP & TCP).
 
-### Step 6.1: Generate Unique Test Query Probes
-Generate nonces to avoid caching and ensure unambiguous correlation:
+### Step 6.1: Configure Test Domain Probes
+* **Allowed Name with Known Answer:** Use a name configured to return a known answer from the controlled upstream resolver (e.g., `allowed-site.test` returning `192.168.100.200`, or `example.com` returning `93.184.215.14`). Avoid random subdomains of unmanaged domains that return `NXDOMAIN`.
+* **Blocked Name with Unique Probe Nonce:** Use a unique nonce under `malware-sample.test` (e.g., `probe-$nonce.malware-sample.test`) to allow unambiguous packet matching at the upstream capture.
 
 ```powershell
+$allowedDomain = "example.com"  # Configured on controlled upstream to return valid A/AAAA records
 $nonce = [Guid]::NewGuid().ToString().Substring(0, 8)
-$allowedDomain = "probe-$nonce-allow.example.com"
-$blockedDomain = "probe-$nonce-block.malware-sample.test"
-Write-Host "Allowed Probe: $allowedDomain"
-Write-Host "Blocked Probe: $blockedDomain"
+$blockedProbe = "probe-$nonce.malware-sample.test"
+Write-Host "Allowed Test Domain: $allowedDomain"
+Write-Host "Blocked Test Probe:  $blockedProbe"
 ```
 
-### Step 6.2: Test IPv4 Resolution (Loopback & Adapter Default)
+### Step 6.2: Test IPv4 Resolution (Allowed vs. Blocked)
 ```powershell
-# 1. Allowed domain resolution via IPv4 loopback
+# 1. Allowed resolution: Must resolve with valid answer (NOERROR, non-empty IP)
 Resolve-DnsName -Name $allowedDomain -Server 127.0.0.1
-# Expected: Resolves successfully (NOERROR)
+# Expected: Returns valid IP address records with Status = Success
 
-# 2. Blocked domain resolution via IPv4 loopback
-# Client must receive the actual blocking response: REFUSED
+# 2. Blocked resolution: Client receives actual blocking response (REFUSED)
 try {
-    Resolve-DnsName -Name $blockedDomain -Server 127.0.0.1 -ErrorAction Stop
-    Write-Host "[FAIL] Blocked domain unexpectedly resolved!" -ForegroundColor Red
+    Resolve-DnsName -Name $blockedProbe -Server 127.0.0.1 -ErrorAction Stop
+    Write-Host "[FAIL] Blocked probe unexpectedly resolved!" -ForegroundColor Red
 } catch {
     Write-Host "[PASS] Client received refusal error: $_" -ForegroundColor Green
 }
 
-# Verify via nslookup (explicitly displays 'Query refused'):
-nslookup $blockedDomain 127.0.0.1
+# Verify via nslookup (displays 'Query refused'):
+nslookup $blockedProbe 127.0.0.1
 # Expected stdout: '*** server can't find ...: Query refused'
 ```
 
-### Step 6.3: Test IPv6 Resolution (Loopback & Adapter Default)
+### Step 6.3: Test IPv6 Resolution (Allowed vs. Blocked)
 ```powershell
-# 1. Allowed domain resolution via IPv6 loopback
+# 1. Allowed resolution over IPv6 loopback
 Resolve-DnsName -Name $allowedDomain -Server ::1
-# Expected: Resolves successfully (NOERROR)
+# Expected: Returns valid IP records
 
-# 2. Blocked domain resolution via IPv6 loopback
+# 2. Blocked resolution over IPv6 loopback
 try {
-    Resolve-DnsName -Name $blockedDomain -Server ::1 -ErrorAction Stop
-    Write-Host "[FAIL] Blocked domain unexpectedly resolved over IPv6!" -ForegroundColor Red
+    Resolve-DnsName -Name $blockedProbe -Server ::1 -ErrorAction Stop
+    Write-Host "[FAIL] Blocked probe unexpectedly resolved over IPv6!" -ForegroundColor Red
 } catch {
     Write-Host "[PASS] Client received refusal over IPv6: $_" -ForegroundColor Green
 }
 
-nslookup $blockedDomain ::1
+nslookup $blockedProbe ::1
 # Expected: 'Query refused'
 ```
 
-### Step 6.4: Test Default Windows Adapter Resolution (No Server Specified)
+### Step 6.4: Test Default Adapter Resolution (No Server Specified)
 ```powershell
-# Query without -Server tests the live adapter routing to the local listener
+# Tests the live adapter routing configured by NetworkManager
 Resolve-DnsName -Name $allowedDomain
-# Expected: Success
+# Expected: Success with valid IP records
 
 try {
-    Resolve-DnsName -Name $blockedDomain -ErrorAction Stop
+    Resolve-DnsName -Name $blockedProbe -ErrorAction Stop
 } catch {
-    Write-Host "[PASS] Default adapter resolution refused for blocked domain." -ForegroundColor Green
+    Write-Host "[PASS] Default adapter resolution refused for blocked probe." -ForegroundColor Green
 }
 ```
 
@@ -204,16 +215,19 @@ try {
 # 1. Gateway Observation: Verify audit trail in SQLite
 sqlite3 "$env:ProgramData\DNS-SHIELD\dns_gateway.db" "SELECT timestamp, client_ip, domain, decision, decision_type, matched_rule, rcode FROM dns_logs WHERE domain LIKE '%$nonce%' ORDER BY id ASC;"
 # Expected:
-#   probe-...-allow.example.com -> decision=ALLOW, rcode=NOERROR
-#   probe-...-block.malware-sample.test -> decision=BLOCK, decision_type=ADMIN_POLICY, matched_rule=malware-sample.test, rcode=REFUSED
+#   domain = probe-<nonce>.malware-sample.test
+#   decision = BLOCK
+#   decision_type = ADMIN_POLICY
+#   matched_rule = malware-sample.test
+#   rcode = REFUSED
 
 # 2. Upstream Observation (on Linux controlled upstream host):
 # Stop packet capture and analyze:
 #   tcpdump -r /tmp/upstream_capture.pcap -n | grep "$nonce"
 #
 # CRITICAL CORRELATION ASSERTIONS:
-# [ASSERTION 1] 'probe-...-allow.example.com' appears in capture (both query & reply).
-# [ASSERTION 2] 'probe-...-block.malware-sample.test' DOES NOT APPEAR AT ALL (0 packets, UDP & TCP).
+# [ASSERTION 1] The allowed domain query appears in the capture and received an upstream response.
+# [ASSERTION 2] 'probe-<nonce>.malware-sample.test' DOES NOT APPEAR AT ALL (0 packets, UDP & TCP).
 ```
 
 ### Step 6.6: Rogue External Port 53 & Port 853 Bypass Prevention
@@ -231,20 +245,23 @@ Test-NetConnection -ComputerName 1.1.1.1 -Port 853
 
 ## 7. Lifecycle Resilience & Restoration Procedures
 
-### Step 7.1: Service Crash & Standalone GUI Recovery (Without IPC)
+### Step 7.1: Service Crash Simulation & Standalone GUI / CLI Recovery
 ```powershell
 # 1. Forcefully kill the background service
 Stop-Process -Name "DNSShieldService" -Force
 
-# 2. Launch GUI as standard unelevated user
-Start-Process -FilePath "C:\TestPackage\DNSShieldApp\DNSShieldApp.exe"
+# 2. Verify degraded health in GUI or CLI:
+& "C:\TestPackage\DNSShieldService\DNSShieldService.exe" cli status
+# Or launch GUI: badge shows 'DEGRADED (DNS TRAPPED)'
 
-# 3. Observe UI:
-# Badge must show: "DEGRADED (DNS TRAPPED)"
-# Button must show: "Restore Network Now"
+# 3. Execute recovery without service IPC:
+# Option A: Click 'Restore Network Now' in GUI (accepts UAC prompt)
+# Option B: Run packaged CLI recovery:
+& "C:\TestPackage\DNSShieldService\DNSShieldService.exe" cli restore-network
+# Option C: Run standalone PowerShell recovery script:
+powershell.exe -ExecutionPolicy Bypass -File "C:\TestPackage\scripts\recovery.ps1"
 
-# 4. Click 'Restore Network Now' -> Approve standard Windows UAC dialog.
-# 5. Confirm Adapter Recovery:
+# 4. Confirm Adapter Recovery:
 Get-DnsClientServerAddress -AddressFamily IPv4 | Select-Object InterfaceAlias, ServerAddresses
 # Expected: Adapters restored to baseline; no longer pointing to 127.0.0.1.
 ```
@@ -253,7 +270,7 @@ Get-DnsClientServerAddress -AddressFamily IPv4 | Select-Object InterfaceAlias, S
 ```powershell
 # 1. Restart service and re-enable protection
 sc.exe start DNSShield
-python -c "from network_manager import NetworkManager; nm = NetworkManager(); nm.enable_protection()"
+& "C:\TestPackage\DNSShieldService\DNSShieldService.exe" cli enable-protection
 
 # 2. Reboot VM
 Restart-Computer -Force
@@ -305,11 +322,11 @@ Test-Path "$env:ProgramFiles\DNS-SHIELD" # Returns False
 | :--- | :--- | :--- | :--- |
 | **VM-01** | SCM Path Quoting & Permissions | Quoted `binPath`, Program Files ACLs (users read-only) | **NOT RUN** |
 | **VM-02** | Explicit Protection Activation | Adapters point to `127.0.0.1`/`::1`, 8 WFP filters registered | **NOT RUN** |
-| **VM-03** | Policy Interface & Engine Loading | `add_rule` via IPC/GUI, confirmed in-memory via `get_rules` | **NOT RUN** |
-| **VM-04** | Allowed Resolution (IPv4 & IPv6) | Resolves with NOERROR; query logged & verified in upstream tcpdump | **NOT RUN** |
+| **VM-03** | Supported Policy Interface & Engine Loading | `add-rule` via Packaged CLI/GUI, confirmed via `get-rules` | **NOT RUN** |
+| **VM-04** | Allowed Resolution (Known Answer) | Resolves with NOERROR and known IP (no NXDOMAIN) | **NOT RUN** |
 | **VM-05** | Blocked Refusal & Upstream Non-Contact | Client receives `REFUSED`; exactly zero packets arrive at upstream (UDP & TCP) | **NOT RUN** |
 | **VM-06** | Rogue Port 53 & Port 853 Bypass | Direct queries to public DNS and port 853 fail/timeout | **NOT RUN** |
-| **VM-07** | Service Crash & Standalone Recovery | Standalone recovery via UAC works with service dead | **NOT RUN** |
+| **VM-07** | Service Crash & Standalone Recovery | Standalone recovery works without service IPC | **NOT RUN** |
 | **VM-08** | Reboot & Service Persistence | Service restarts automatically; resolution works after reboot | **NOT RUN** |
 | **VM-09** | Dual Restoration (DHCP & Static) | DHCP restored to DHCP; Static restored to exact static IPs | **NOT RUN** |
 | **VM-10** | Clean Uninstallation | Service, WFP filters, firewall rules, and files cleanly removed | **NOT RUN** |

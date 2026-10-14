@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import platform
+import sys
 import threading
 import time
 from pathlib import Path
@@ -18,7 +19,7 @@ from typing import Any, Dict, List, Optional
 from gateway.config import GatewayConfig
 from gateway.db import get_db, init_db
 from gateway.server import DNSGatewayServer
-from local_ipc import NamedPipeServer, ensure_ipc_secret
+from local_ipc import NamedPipeServer, NamedPipeClient, ensure_ipc_secret
 from network_manager import NetworkManager
 from service_health import HealthState, ProtectionHealth, evaluate_health
 
@@ -473,7 +474,87 @@ else:
     DNSShieldWindowsService = None
 
 
+def handle_cli_command(args: List[str]) -> int:
+    """
+    Packaged administrative CLI for headless VM integration and management.
+    Reads ipc.secret internally without exposing secrets on the process command line.
+    """
+    if not args or args[0] in ("-h", "--help", "help"):
+        print("DNS-SHIELD Packaged Administrative CLI")
+        print("Usage: DNSShieldService.exe cli <command> [arguments]\n")
+        print("Commands:")
+        print("  add-rule <domain> [rule_type] [reason]   Add a custom domain block rule")
+        print("  get-rules                                 Query active rules loaded in memory")
+        print("  enable-protection                         Enable live DNS adapter redirection")
+        print("  status                                    Query service and protection health status")
+        print("  restore-network                           Restore original adapter DNS settings")
+        return 0
+
+    subcmd = args[0].lower()
+    secret_path = program_data_dir() / "ipc.secret"
+    secret = None
+    if secret_path.exists():
+        try:
+            secret = secret_path.read_bytes().strip()
+        except Exception as e:
+            logger.debug(f"Could not read internal IPC secret: {e}")
+
+    client = NamedPipeClient(secret=secret)
+
+    if subcmd == "add-rule":
+        if len(args) < 2:
+            print("Error: add-rule requires <domain>", file=sys.stderr)
+            return 1
+        domain = args[1].strip().lower()
+        rule_type = args[2] if len(args) > 2 else "subdomain"
+        reason = args[3] if len(args) > 3 else "Administrative CLI Rule"
+        resp = client.call("add_rule", {"domain": domain, "rule_type": rule_type, "reason": reason})
+        print(json.dumps(resp, indent=2))
+        return 0 if resp.get("ok") else 1
+
+    elif subcmd == "get-rules":
+        resp = client.call("get_rules")
+        print(json.dumps(resp, indent=2))
+        return 0 if resp.get("ok") else 1
+
+    elif subcmd == "enable-protection":
+        resp = client.call("set_enabled", {"enabled": True})
+        if not resp.get("ok"):
+            nm = NetworkManager()
+            res = nm.enable_protection()
+            print(json.dumps(res, indent=2))
+            return 0 if res.get("success") else 1
+        print(json.dumps(resp, indent=2))
+        return 0
+
+    elif subcmd == "status":
+        resp = client.call("get_status")
+        print(json.dumps(resp, indent=2))
+        return 0 if resp.get("ok") else 1
+
+    elif subcmd == "restore-network":
+        resp = client.call("restore_network")
+        if not resp.get("ok"):
+            nm = NetworkManager()
+            res = nm.restore_dns()
+            print(json.dumps(res, indent=2))
+            return 0 if res.get("success") else 1
+        print(json.dumps(resp, indent=2))
+        return 0
+
+    else:
+        print(f"Unknown CLI command: '{subcmd}'. Run 'cli --help' for usage.", file=sys.stderr)
+        return 1
+
+
 def main() -> None:
+    if len(sys.argv) > 1:
+        first = sys.argv[1].lower()
+        if first == "cli":
+            sys.exit(handle_cli_command(sys.argv[2:]))
+        elif first in ("add-rule", "get-rules", "enable-protection", "status", "restore-network"):
+            sys.exit(handle_cli_command(sys.argv[1:]))
+
     if DNSShieldWindowsService is None:
         raise RuntimeError("Windows SCM integration requires Windows and pywin32.")
     win32serviceutil.HandleCommandLine(DNSShieldWindowsService)

@@ -22,7 +22,22 @@ BASE_DIR = Path(__file__).resolve().parent
 DIST_DIR = BASE_DIR / "dist"
 BUILD_DIR = BASE_DIR / "build"
 PYTHON_EXE = sys.executable
-ISCC_DEFAULT_PATH = Path(r"C:\Program Files (x86)\Inno Setup 6\ISCC.exe")
+
+
+def find_iscc_compiler() -> Optional[Path]:
+    """Finds Inno Setup 6 ISCC.exe in standard user and machine install paths."""
+    candidates = [
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Inno Setup 6" / "ISCC.exe",
+        Path(r"C:\Program Files (x86)\Inno Setup 6\ISCC.exe"),
+        Path(r"C:\Program Files\Inno Setup 6\ISCC.exe"),
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    sh_iscc = shutil.which("ISCC.exe")
+    if sh_iscc:
+        return Path(sh_iscc)
+    return None
 
 
 def compute_sha256(file_path: Path) -> str:
@@ -281,14 +296,7 @@ def build():
 
     # 6. Inno Setup Compilation Check
     print("\n[4/4] Checking for Inno Setup Compiler (ISCC.exe)...")
-    iscc_path: Optional[Path] = None
-    if ISCC_DEFAULT_PATH.exists():
-        iscc_path = ISCC_DEFAULT_PATH
-    else:
-        sh_iscc = shutil.which("ISCC.exe")
-        if sh_iscc:
-            iscc_path = Path(sh_iscc)
-
+    iscc_path = find_iscc_compiler()
     iss_file = BASE_DIR / "installer" / "DNS-SHIELD-Setup.iss"
 
     if iscc_path and iscc_path.exists():

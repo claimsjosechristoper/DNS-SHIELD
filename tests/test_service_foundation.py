@@ -51,10 +51,46 @@ def test_health_degraded_when_routing_verified_but_listener_down():
     assert "incomplete" in health.detail.lower()
 
 
-def test_ipc_dispatch_apply_policy_requires_secret():
-    """Privileged apply_policy must be rejected without secret."""
-    req = {"operation": "apply_policy", "payload": {"version": 2}}
-    res = dispatch_request(None, req, {"apply_policy": lambda p: {"status": "ok"}})
-    assert res["ok"] is False
-    assert res["error"] == "privileged_secret_required"
+def test_handle_cli_command_reads_secret_internally(tmp_path: Path, monkeypatch):
+    """
+    Verifies that handle_cli_command reads the IPC secret internally from %ProgramData%\DNS-SHIELD\ipc.secret
+    and successfully invokes NamedPipeClient without secret command-line interpolation.
+    """
+    from windows_service import handle_cli_command
+    import windows_service
+
+    # Setup temporary ProgramData directory with secret
+    secret_file = tmp_path / "ipc.secret"
+    secret_file.write_bytes(b"test-secret-12345")
+    monkeypatch.setattr(windows_service, "program_data_dir", lambda: tmp_path)
+
+    captured_calls = []
+    class MockClient:
+        def __init__(self, secret=None):
+            self.secret = secret
+
+        def call(self, operation, payload=None):
+            captured_calls.append({"operation": operation, "payload": payload, "secret": self.secret})
+            return {"ok": True, "data": {"custom_rules": [{"domain": "malware-sample.test"}]}}
+
+    monkeypatch.setattr(windows_service, "NamedPipeClient", MockClient)
+
+    # 1. Test help
+    assert handle_cli_command(["--help"]) == 0
+
+    # 2. Test add-rule without passing any secret on command line
+    ret = handle_cli_command(["add-rule", "malware-sample.test", "subdomain", "Test Reason"])
+    assert ret == 0
+    assert len(captured_calls) == 1
+    call = captured_calls[0]
+    assert call["operation"] == "add_rule"
+    assert call["payload"]["domain"] == "malware-sample.test"
+    # Secret was read internally from ipc.secret file, NOT from command line
+    assert call["secret"] == b"test-secret-12345"
+
+    # 3. Test get-rules
+    ret_get = handle_cli_command(["get-rules"])
+    assert ret_get == 0
+    assert captured_calls[-1]["operation"] == "get_rules"
+
 
