@@ -13,14 +13,18 @@ let logsOffset = 0;
 const logsLimit = 50;
 let debounceTimer = null;
 
-// Chart Instances
+// Chart Instances & Telemetry Aggregation State
 let chartTraffic = null;
 let chartDecisions = null;
-const trafficHistory = {
-    labels: [],
-    allowed: [],
-    blocked: []
-};
+const WINDOW_SECONDS = 60;
+// One-second timestamp buckets: epochSecond -> { allowed: number, blocked: number }
+const secondBuckets = new Map();
+
+// Connection State: "CONNECTING", "CONNECTED", "RECONNECTING", "DISCONNECTED"
+let wsConnectionState = "DISCONNECTED";
+let lastReceivedEventTime = null;
+let reconnectTimer = null;
+let chartTicker = null;
 
 // WebSocket Reference
 let ws = null;
@@ -31,6 +35,11 @@ document.addEventListener("DOMContentLoaded", () => {
     initCharts();
     loadDashboardStats();
     connectWebSocket();
+
+    // Start 1-second rolling chart ticker (renders at most once per second)
+    if (!chartTicker) {
+        chartTicker = setInterval(renderTrafficChart, 1000);
+    }
 
     // Auto-refresh stats every 4 seconds
     setInterval(loadDashboardStats, 4000);
@@ -61,16 +70,35 @@ function openKeyModal() {
     document.getElementById("modal-api-key").style.display = "flex";
 }
 
-function saveApiKey(e) {
+async function saveApiKey(e) {
     e.preventDefault();
     const val = document.getElementById("input-api-key").value.trim();
-    if (val) {
+    if (!val) {
+        return;
+    }
+
+    try {
+        const resp = await fetch(`${API_BASE}/api/auth/login`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ api_key: val })
+        });
+        const result = await resp.json();
+        if (!resp.ok) {
+            throw new Error(result.detail || "Invalid administrative API key.");
+        }
+
         apiKey = val;
         localStorage.setItem("dns_gateway_admin_key", apiKey);
         updateAuthIndicator();
         closeModals();
-        alert("Administrative API Key saved.");
+        alert("Administrative API Key authorized.");
         refreshActiveTabData();
+    } catch (error) {
+        apiKey = "";
+        localStorage.removeItem("dns_gateway_admin_key");
+        updateAuthIndicator();
+        alert(`Authorization failed: ${error.message}`);
     }
 }
 
@@ -103,10 +131,123 @@ function refreshActiveTabData() {
 }
 
 // Chart Initializations
+class LocalChart {
+    constructor(canvas, config) {
+        this.canvas = canvas;
+        this.type = config.type;
+        this.data = config.data;
+        this.resizeObserver = new ResizeObserver(() => this.update());
+        this.resizeObserver.observe(canvas.parentElement || canvas);
+        this.update();
+    }
+
+    update() {
+        const rect = (this.canvas.parentElement || this.canvas).getBoundingClientRect();
+        const width = Math.max(1, Math.floor(rect.width));
+        const height = Math.max(1, Math.floor(rect.height));
+        const ratio = window.devicePixelRatio || 1;
+        this.canvas.width = width * ratio;
+        this.canvas.height = height * ratio;
+        const ctx = this.canvas.getContext("2d");
+        ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+        ctx.clearRect(0, 0, width, height);
+        if (this.type === "doughnut") {
+            this.drawDoughnut(ctx, width, height);
+        } else {
+            this.drawLine(ctx, width, height);
+        }
+    }
+
+    drawLine(ctx, width, height) {
+        const left = 42;
+        const right = 12;
+        const top = 12;
+        const bottom = 28;
+        const plotWidth = Math.max(1, width - left - right);
+        const plotHeight = Math.max(1, height - top - bottom);
+        const datasets = this.data.datasets || [];
+        const values = datasets.flatMap(dataset =>
+            dataset.data.filter(value => typeof value === "number" && Number.isFinite(value))
+        );
+        const maxValue = Math.max(1, ...values);
+
+        ctx.font = "10px Inter, sans-serif";
+        ctx.strokeStyle = "rgba(51, 65, 85, 0.25)";
+        ctx.fillStyle = "#64748b";
+        ctx.lineWidth = 1;
+        for (let i = 0; i <= 4; i += 1) {
+            const y = top + (plotHeight * i / 4);
+            ctx.beginPath();
+            ctx.moveTo(left, y);
+            ctx.lineTo(width - right, y);
+            ctx.stroke();
+            ctx.fillText(String(Math.round(maxValue * (4 - i) / 4)), 4, y + 3);
+        }
+
+        datasets.forEach(dataset => {
+            const points = dataset.data;
+            if (!points.length) return;
+            ctx.strokeStyle = dataset.borderColor || "#3b82f6";
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            let started = false;
+            points.forEach((value, index) => {
+                if (typeof value !== "number" || !Number.isFinite(value)) {
+                    started = false;
+                    return;
+                }
+                const x = left + (plotWidth * index / Math.max(1, points.length - 1));
+                const y = top + plotHeight - (value / maxValue * plotHeight);
+                if (!started) {
+                    ctx.moveTo(x, y);
+                    started = true;
+                } else {
+                    ctx.lineTo(x, y);
+                }
+            });
+            ctx.stroke();
+        });
+    }
+
+    drawDoughnut(ctx, width, height) {
+        const values = this.data.datasets[0].data.map(value => Number(value) || 0);
+        const total = values.reduce((sum, value) => sum + value, 0);
+        const radius = Math.max(20, Math.min(width, height) * 0.34);
+        const centerX = width / 2;
+        const centerY = height / 2;
+        const colors = this.data.datasets[0].backgroundColor;
+        let angle = -Math.PI / 2;
+
+        if (total > 0) {
+            values.forEach((value, index) => {
+                const nextAngle = angle + (value / total) * Math.PI * 2;
+                ctx.beginPath();
+                ctx.arc(centerX, centerY, radius, angle, nextAngle);
+                ctx.strokeStyle = colors[index];
+                ctx.lineWidth = radius * 0.35;
+                ctx.stroke();
+                angle = nextAngle;
+            });
+        } else {
+            ctx.beginPath();
+            ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
+            ctx.strokeStyle = "#cbd5e1";
+            ctx.lineWidth = radius * 0.35;
+            ctx.stroke();
+        }
+
+        ctx.font = "600 12px Inter, sans-serif";
+        ctx.fillStyle = "#64748b";
+        ctx.textAlign = "center";
+        ctx.fillText(total.toLocaleString(), centerX, centerY + 4);
+        ctx.textAlign = "start";
+    }
+}
+
 function initCharts() {
     const ctxTraffic = document.getElementById("chart-traffic");
-    if (ctxTraffic) {
-        chartTraffic = new Chart(ctxTraffic, {
+    if (ctxTraffic && !chartTraffic) {
+        chartTraffic = new LocalChart(ctxTraffic, {
             type: "line",
             data: {
                 labels: [],
@@ -115,42 +256,77 @@ function initCharts() {
                         label: "ALLOWED",
                         data: [],
                         borderColor: "#10b981",
-                        backgroundColor: "rgba(16, 185, 129, 0.1)",
+                        backgroundColor: "rgba(16, 185, 129, 0.15)",
                         fill: true,
-                        tension: 0.3,
-                        borderWidth: 2
+                        tension: 0.25,
+                        borderWidth: 2,
+                        pointRadius: 1,
+                        spanGaps: false
                     },
                     {
                         label: "BLOCKED",
                         data: [],
                         borderColor: "#ef4444",
-                        backgroundColor: "rgba(239, 68, 68, 0.1)",
+                        backgroundColor: "rgba(239, 68, 68, 0.15)",
                         fill: true,
-                        tension: 0.3,
-                        borderWidth: 2
+                        tension: 0.25,
+                        borderWidth: 2,
+                        pointRadius: 1,
+                        spanGaps: false
                     }
                 ]
             },
             options: {
                 responsive: true,
                 maintainAspectRatio: false,
-                plugins: { legend: { labels: { color: "#94a3b8" } } },
+                animation: false,
+                plugins: {
+                    legend: {
+                        position: "top",
+                        labels: { color: "#94a3b8", boxWidth: 12, font: { size: 11 } }
+                    },
+                    tooltip: {
+                        mode: "index",
+                        intersect: false
+                    }
+                },
                 scales: {
-                    x: { ticks: { color: "#64748b" }, grid: { color: "rgba(51,65,85,0.2)" } },
-                    y: { beginAtZero: true, ticks: { color: "#64748b" }, grid: { color: "rgba(51,65,85,0.2)" } }
+                    x: {
+                        ticks: {
+                            color: "#64748b",
+                            maxTicksLimit: 10,
+                            font: { size: 10 }
+                        },
+                        grid: { color: "rgba(51,65,85,0.2)" }
+                    },
+                    y: {
+                        beginAtZero: true,
+                        ticks: {
+                            color: "#64748b",
+                            precision: 0,
+                            font: { size: 10 }
+                        },
+                        grid: { color: "rgba(51,65,85,0.2)" },
+                        title: {
+                            display: true,
+                            text: "Queries per second",
+                            color: "#94a3b8",
+                            font: { size: 11, weight: "bold" }
+                        }
+                    }
                 }
             }
         });
     }
 
     const ctxDecisions = document.getElementById("chart-decisions");
-    if (ctxDecisions) {
-        chartDecisions = new Chart(ctxDecisions, {
+    if (ctxDecisions && !chartDecisions) {
+        chartDecisions = new LocalChart(ctxDecisions, {
             type: "doughnut",
             data: {
                 labels: ["ALLOWED", "BLOCKED"],
                 datasets: [{
-                    data: [1, 0],
+                    data: [0, 0],
                     backgroundColor: ["#10b981", "#ef4444"],
                     borderColor: "#070a13",
                     borderWidth: 2
@@ -159,11 +335,61 @@ function initCharts() {
             options: {
                 responsive: true,
                 maintainAspectRatio: false,
-                plugins: { legend: { position: "bottom", labels: { color: "#94a3b8" } } },
+                plugins: {
+                    legend: { position: "bottom", labels: { color: "#94a3b8" } }
+                },
                 cutout: "70%"
             }
         });
     }
+}
+
+// Render rolling 60-second window aggregated in 1-second buckets
+function renderTrafficChart() {
+    if (!chartTraffic) return;
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const labels = [];
+    const allowedData = [];
+    const blockedData = [];
+
+    // Prune buckets older than window + 10s
+    const pruneThreshold = nowSec - WINDOW_SECONDS - 10;
+    for (const [secKey] of secondBuckets) {
+        if (secKey < pruneThreshold) {
+            secondBuckets.delete(secKey);
+        }
+    }
+
+    const isConnected = (wsConnectionState === "CONNECTED");
+
+    for (let i = WINDOW_SECONDS - 1; i >= 0; i--) {
+        const targetSec = nowSec - i;
+        const d = new Date(targetSec * 1000);
+        const timeLabel = d.toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        labels.push(timeLabel);
+
+        if (secondBuckets.has(targetSec)) {
+            const b = secondBuckets.get(targetSec);
+            allowedData.push(b.allowed);
+            blockedData.push(b.blocked);
+        } else {
+            // Connected with zero traffic -> 0
+            // Disconnected / telemetry unavailable -> null (creates gap, no fake zero)
+            if (isConnected) {
+                allowedData.push(0);
+                blockedData.push(0);
+            } else {
+                allowedData.push(null);
+                blockedData.push(null);
+            }
+        }
+    }
+
+    chartTraffic.data.labels = labels;
+    chartTraffic.data.datasets[0].data = allowedData;
+    chartTraffic.data.datasets[1].data = blockedData;
+    chartTraffic.update("none");
 }
 
 // Dashboard Overview Data
@@ -215,12 +441,97 @@ function updateDecisionsChart(allowed, blocked) {
     }
 }
 
-// Real-Time WebSocket Connection
+// Connection State Management & UI Updates
+function setConnectionState(state) {
+    wsConnectionState = state;
+    updateConnectionStatusUI();
+}
+
+function updateConnectionStatusUI() {
+    const wsStatusText = document.getElementById("ws-status-text");
+    const wsPulseDot = document.getElementById("ws-pulse-dot");
+    const gatewayStatusText = document.getElementById("gateway-status-text");
+    const systemStatus = document.getElementById("system-status");
+
+    let statusLabel = "";
+    let isOnline = false;
+
+    switch (wsConnectionState) {
+        case "CONNECTING":
+            statusLabel = "Connecting...";
+            if (wsPulseDot) wsPulseDot.className = "pulse-dot pulse-amber";
+            break;
+        case "CONNECTED":
+            isOnline = true;
+            if (lastReceivedEventTime) {
+                const timeStr = lastReceivedEventTime.toLocaleTimeString([], { hour12: false });
+                statusLabel = `Connected — Last event: ${timeStr}`;
+            } else {
+                statusLabel = "Connected — waiting for DNS traffic";
+            }
+            if (wsPulseDot) wsPulseDot.className = "pulse-dot";
+            break;
+        case "RECONNECTING":
+            statusLabel = "Reconnecting...";
+            if (wsPulseDot) wsPulseDot.className = "pulse-dot pulse-amber";
+            break;
+        case "DISCONNECTED":
+        default:
+            statusLabel = "Disconnected";
+            if (wsPulseDot) wsPulseDot.className = "pulse-dot pulse-red";
+            break;
+    }
+
+    if (wsStatusText) {
+        wsStatusText.textContent = statusLabel;
+    }
+
+    if (gatewayStatusText) {
+        gatewayStatusText.textContent = isOnline ? "GATEWAY ONLINE" : "OFFLINE / RECONNECTING";
+    }
+    if (systemStatus) {
+        if (isOnline) {
+            systemStatus.classList.remove("status-offline");
+        } else {
+            systemStatus.classList.add("status-offline");
+        }
+    }
+}
+
+// Real-Time WebSocket Connection Lifecycle
 function connectWebSocket() {
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+
+    if (ws) {
+        try {
+            ws.onopen = null;
+            ws.onmessage = null;
+            ws.onclose = null;
+            ws.onerror = null;
+            ws.close();
+        } catch (e) {}
+        ws = null;
+    }
+
+    setConnectionState("CONNECTING");
+
     const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";
     const wsUrl = `${wsProto}//${window.location.host}/ws/live`;
 
-    ws = new WebSocket(wsUrl);
+    try {
+        ws = new WebSocket(wsUrl);
+    } catch (err) {
+        console.error("Failed to construct WebSocket:", err);
+        scheduleReconnect();
+        return;
+    }
+
+    ws.onopen = () => {
+        setConnectionState("CONNECTED");
+    };
 
     ws.onmessage = (event) => {
         try {
@@ -229,59 +540,89 @@ function connectWebSocket() {
                 handleLiveDNSEvent(payload.data);
             }
         } catch (e) {
-            console.error("WS parse error:", e);
+            console.error("WS message parse error:", e);
         }
     };
 
     ws.onclose = () => {
-        setTimeout(connectWebSocket, 3000);
+        setConnectionState("DISCONNECTED");
+        scheduleReconnect();
     };
 
     ws.onerror = (e) => {
-        console.warn("WS error:", e);
+        console.warn("WS error encountered:", e);
     };
 }
 
+function scheduleReconnect() {
+    if (reconnectTimer) return;
+    setConnectionState("RECONNECTING");
+    reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connectWebSocket();
+    }, 2500);
+}
+
 function handleLiveDNSEvent(event) {
-    // 1. Add to live streaming table on Overview
+    if (!event || typeof event !== "object") {
+        console.warn("Dropped malformed live DNS event:", event);
+        return;
+    }
+
+    const rawDecision = (event.decision || "").toUpperCase();
+    let isAllow = false;
+    let isBlock = false;
+
+    if (rawDecision === "ALLOW" || rawDecision === "ALLOWED") {
+        isAllow = true;
+    } else if (rawDecision === "BLOCK" || rawDecision === "BLOCKED" || rawDecision === "REFUSED") {
+        isBlock = true;
+    } else {
+        console.warn(`Unknown DNS decision type '${event.decision}', recorded in blocked series`, event);
+        isBlock = true;
+    }
+
+    // 1. Record event in 1-second aggregation bucket
+    let sec = null;
+    if (typeof event.timestamp === "number" && !isNaN(event.timestamp) && event.timestamp > 0) {
+        sec = Math.floor(event.timestamp);
+    } else {
+        sec = Math.floor(Date.now() / 1000);
+    }
+
+    if (!secondBuckets.has(sec)) {
+        secondBuckets.set(sec, { allowed: 0, blocked: 0 });
+    }
+    const bucket = secondBuckets.get(sec);
+    if (isAllow) {
+        bucket.allowed += 1;
+    } else {
+        bucket.blocked += 1;
+    }
+
+    lastReceivedEventTime = new Date();
+    updateConnectionStatusUI();
+
+    // 2. Add to live streaming table on Overview
     const streamTbody = document.getElementById("live-stream-table-body");
     if (streamTbody) {
-        const timeStr = new Date(event.timestamp * 1000).toLocaleTimeString();
-        const isAllow = event.decision === "ALLOW";
+        const timeStr = new Date(sec * 1000).toLocaleTimeString([], { hour12: false });
         const badgeClass = isAllow ? "badge-allow" : "badge-block";
+        const displayDecision = isAllow ? "ALLOW" : "BLOCK";
 
         const row = document.createElement("tr");
         row.innerHTML = `
             <td style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--text-dim);">${timeStr}</td>
-            <td style="font-family: var(--font-mono); font-size: 0.8rem;">${escapeHtml(event.client_ip)}</td>
-            <td style="font-family: var(--font-mono); font-weight:600; color: ${isAllow ? '#a7f3d0' : '#fca5a5'};">${escapeHtml(event.domain)}</td>
-            <td><span class="badge-decision ${badgeClass}">${escapeHtml(event.decision)}</span></td>
-            <td style="font-size: 0.78rem; color: var(--text-muted);">${escapeHtml(event.reason || event.matched_rule)}</td>
+            <td style="font-family: var(--font-mono); font-size: 0.8rem;">${escapeHtml(event.client_ip || "127.0.0.1")}</td>
+            <td style="font-family: var(--font-mono); font-weight:600; color: ${isAllow ? '#a7f3d0' : '#fca5a5'};">${escapeHtml(event.domain || "-")}</td>
+            <td><span class="badge-decision ${badgeClass}">${displayDecision}</span></td>
+            <td style="font-size: 0.78rem; color: var(--text-muted);">${escapeHtml(event.reason || event.matched_rule || "-")}</td>
         `;
 
         streamTbody.insertBefore(row, streamTbody.firstChild);
-        if (streamTbody.children.length > 25) {
+        if (streamTbody.children.length > 30) {
             streamTbody.removeChild(streamTbody.lastChild);
         }
-    }
-
-    // 2. Update Traffic Chart
-    if (chartTraffic) {
-        const nowSec = new Date().toLocaleTimeString();
-        trafficHistory.labels.push(nowSec);
-        trafficHistory.allowed.push(event.decision === "ALLOW" ? 1 : 0);
-        trafficHistory.blocked.push(event.decision === "BLOCK" ? 1 : 0);
-
-        if (trafficHistory.labels.length > 20) {
-            trafficHistory.labels.shift();
-            trafficHistory.allowed.shift();
-            trafficHistory.blocked.shift();
-        }
-
-        chartTraffic.data.labels = trafficHistory.labels;
-        chartTraffic.data.datasets[0].data = trafficHistory.allowed;
-        chartTraffic.data.datasets[1].data = trafficHistory.blocked;
-        chartTraffic.update("none");
     }
 }
 

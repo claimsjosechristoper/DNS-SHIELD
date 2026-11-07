@@ -1,0 +1,12 @@
+# Phishing Domain Threat Feed (Local Curated Test Feed)
+# Known Phishing, Credential Harvester, and Impersonation Domains
+login-microsoft-secure.test
+verify-paypal-account.bad
+appleid-support-auth.invalid
+google-account-verify.fake
+banking-portal-secure-login.test
+chase-bank-alert.test
+wells-fargo-alert-update.fake
+office365-password-reset.test
+credential-trap.evil
+secure-mail-login.test

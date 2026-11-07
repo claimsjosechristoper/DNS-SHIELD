@@ -9,7 +9,9 @@ import sys
 import time
 import asyncio
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set
+from contextlib import asynccontextmanager
+from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Query, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -28,25 +30,23 @@ from api.auth import verify_admin_key
 
 logger = logging.getLogger("DNSShield.API")
 
-# Initialize SQLite database schema
-init_db(GatewayConfig.DB_PATH)
+def get_active_db_path() -> str:
+    """Detects active service database in ProgramData, env override, or local config."""
+    env_db = os.getenv("GATEWAY_DB_PATH")
+    if env_db and os.path.exists(env_db):
+        return env_db
+    program_data = os.getenv("PROGRAMDATA")
+    if program_data:
+        svc_db = Path(program_data) / "DNS-SHIELD" / "dns_gateway.db"
+        if svc_db.exists():
+            return str(svc_db)
+    return GatewayConfig.DB_PATH
+
+# Initialize active SQLite database schema
+init_db(get_active_db_path())
 
 # Initialize Global Policy Engine
-policy_engine = PolicyEngine(db_path=GatewayConfig.DB_PATH)
-
-app = FastAPI(
-    title="DNS Security Gateway API",
-    description="Deterministic ALLOW/BLOCK DNS Security Gateway & Threat Management Platform",
-    version="2.0.0"
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+policy_engine = PolicyEngine(db_path=get_active_db_path())
 
 # Active WebSocket Connection Manager
 class ConnectionManager:
@@ -56,30 +56,163 @@ class ConnectionManager:
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self.active_connections.append(websocket)
+        logger.info(f"WebSocket client connected. Total active: {len(self.active_connections)}")
 
     def disconnect(self, websocket: WebSocket):
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
+            logger.info(f"WebSocket client disconnected. Total active: {len(self.active_connections)}")
 
     async def broadcast(self, message: Dict[str, Any]):
         for connection in list(self.active_connections):
             try:
                 await connection.send_json(message)
-            except Exception:
+            except Exception as exc:
+                logger.debug(f"Failed to send to client; disconnecting: {exc}")
                 self.disconnect(connection)
+
+    async def close_all(self):
+        for connection in list(self.active_connections):
+            try:
+                await connection.close()
+            except Exception:
+                pass
+        self.active_connections.clear()
 
 ws_manager = ConnectionManager()
 
-# Hook event listener from policy engine to broadcast over WebSocket
+# Thread-safe Bounded Event Bridge State
+_main_loop: Optional[asyncio.AbstractEventLoop] = None
+_event_queue: Optional[asyncio.Queue] = None
+_dispatcher_task: Optional[asyncio.Task] = None
+_service_bridge_task: Optional[asyncio.Task] = None
+_recent_dispatched_ids: Set[int] = set()
+
 def broadcast_dns_event(event: Dict[str, Any]):
+    """
+    Thread-safe callback invoked synchronously by PolicyEngine on DNS worker threads.
+    Safely bridges event into the FastAPI asyncio event loop queue.
+    """
+    global _main_loop
+    if _main_loop and _main_loop.is_running() and _event_queue is not None:
+        try:
+            _main_loop.call_soon_threadsafe(_enqueue_event, event)
+        except Exception as exc:
+            logger.error(f"Failed to schedule DNS event for delivery: {exc}")
+    else:
+        logger.debug("API event loop not active; skipped in-memory event broadcast")
+
+def _enqueue_event(event: Dict[str, Any]):
+    global _event_queue
+    if _event_queue is None:
+        return
+    if isinstance(event, dict) and event.get("id"):
+        _recent_dispatched_ids.add(event["id"])
+        if len(_recent_dispatched_ids) > 2000:
+            _recent_dispatched_ids.clear()
+    msg = {"type": "DNS_EVENT", "data": event}
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.create_task(ws_manager.broadcast({"type": "DNS_EVENT", "data": event}))
+        _event_queue.put_nowait(msg)
+    except asyncio.QueueFull:
+        try:
+            _event_queue.get_nowait()  # Drop oldest to protect memory bounds
+        except Exception:
+            pass
+        _event_queue.put_nowait(msg)
+
+async def _event_dispatcher():
+    global _event_queue
+    while True:
+        try:
+            msg = await _event_queue.get()
+            await ws_manager.broadcast(msg)
+            _event_queue.task_done()
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.error(f"Error in live event dispatcher: {exc}")
+            await asyncio.sleep(0.05)
+
+async def _poll_service_events():
+    """
+    Polls active service database to bridge events when running as a separate Windows Service process.
+    """
+    last_id = 0
+    try:
+        conn = get_db(get_active_db_path())
+        cur = conn.cursor()
+        cur.execute("SELECT MAX(id) FROM dns_logs")
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            last_id = row[0]
+        conn.close()
     except Exception:
         pass
 
+    while True:
+        try:
+            await asyncio.sleep(0.5)
+            active_db = get_active_db_path()
+            conn = get_db(active_db)
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT id, timestamp, client_ip, domain, qtype, decision, decision_type, matched_rule, reason, rcode, response_time_ms
+                FROM dns_logs
+                WHERE id > ?
+                ORDER BY id ASC
+                LIMIT 50
+            """, (last_id,))
+            rows = [dict(r) for r in cur.fetchall()]
+            conn.close()
+
+            for r in rows:
+                last_id = max(last_id, r["id"])
+                if r["id"] not in _recent_dispatched_ids:
+                    _recent_dispatched_ids.add(r["id"])
+                    if len(_recent_dispatched_ids) > 2000:
+                        _recent_dispatched_ids.clear()
+                    _enqueue_event(r)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.debug(f"Service event polling bridge: {exc}")
+            await asyncio.sleep(2.0)
+
+# Hook event listener from policy engine to broadcast over WebSocket
 policy_engine.set_event_listener(broadcast_dns_event)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _main_loop, _event_queue, _dispatcher_task, _service_bridge_task
+    _main_loop = asyncio.get_running_loop()
+    _event_queue = asyncio.Queue(maxsize=2000)
+    _dispatcher_task = asyncio.create_task(_event_dispatcher())
+    _service_bridge_task = asyncio.create_task(_poll_service_events())
+    logger.info("FastAPI live telemetry bridge initialized.")
+    try:
+        yield
+    finally:
+        logger.info("Shutting down live telemetry bridge...")
+        if _dispatcher_task:
+            _dispatcher_task.cancel()
+        if _service_bridge_task:
+            _service_bridge_task.cancel()
+        await ws_manager.close_all()
+
+app = FastAPI(
+    title="DNS Security Gateway API",
+    description="Deterministic ALLOW/BLOCK DNS Security Gateway & Threat Management Platform",
+    version="2.0.0",
+    lifespan=lifespan
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Pydantic Request Models
 class LoginRequest(BaseModel):
@@ -130,7 +263,7 @@ class PruneLogsRequest(BaseModel):
 @app.get("/api/status")
 def get_status():
     """Returns overall health, listener configuration, and query counts."""
-    stats = get_dashboard_statistics(GatewayConfig.DB_PATH)
+    stats = get_dashboard_statistics(get_active_db_path())
     return {
         "status": "ONLINE",
         "system": "DNS Security Gateway",
@@ -147,7 +280,7 @@ def get_status():
 @app.get("/api/dns/statistics")
 def get_dns_statistics():
     """Returns metrics for dashboard charts and counters without risk scoring."""
-    stats = get_dashboard_statistics(GatewayConfig.DB_PATH)
+    stats = get_dashboard_statistics(get_active_db_path())
     return {
         "total_queries": stats["total_requests"],
         "allowed_queries": stats["allowed_requests"],
@@ -177,14 +310,14 @@ def get_logs(
         search_domain=search,
         client_ip=client_ip,
         qtype=qtype,
-        db_path=GatewayConfig.DB_PATH
+        db_path=get_active_db_path()
     )
     return {"total": total, "limit": limit, "offset": offset, "logs": logs}
 
 @app.get("/api/dns/latest")
 def get_dns_latest():
     """Returns most recent DNS query log."""
-    logs, _ = get_dns_logs(limit=1, db_path=GatewayConfig.DB_PATH)
+    logs, _ = get_dns_logs(limit=1, db_path=get_active_db_path())
     if not logs:
         return {"message": "No DNS queries recorded yet."}
     return logs[0]
@@ -195,13 +328,13 @@ def get_dns_latest():
 def login_admin(req: LoginRequest):
     """Authenticates administrator with API key."""
     if req.api_key == GatewayConfig.ADMIN_API_KEY:
-        record_audit("admin", "LOGIN_SUCCESS", "AUTH", None, {"ip": "client"}, GatewayConfig.DB_PATH)
+        record_audit("admin", "LOGIN_SUCCESS", "AUTH", None, {"ip": "client"}, get_active_db_path())
         return {
             "status": "SUCCESS",
             "token": GatewayConfig.ADMIN_API_KEY,
             "username": GatewayConfig.ADMIN_USERNAME
         }
-    record_audit("anonymous", "LOGIN_FAILED", "AUTH", None, {}, GatewayConfig.DB_PATH)
+    record_audit("anonymous", "LOGIN_FAILED", "AUTH", None, {}, get_active_db_path())
     raise HTTPException(status_code=401, detail="Invalid administrative API Key.")
 
 @app.get("/api/auth/verify")
@@ -214,7 +347,7 @@ def verify_session(admin: str = Depends(verify_admin_key)):
 # --- 1. Custom Blocking Rules ---
 @app.get("/api/rules/custom")
 def list_custom_rules(admin: str = Depends(verify_admin_key)):
-    conn = get_db(GatewayConfig.DB_PATH)
+    conn = get_db(get_active_db_path())
     cur = conn.cursor()
     cur.execute("SELECT id, domain, rule_type, action, enabled, reason, created_at, updated_at FROM custom_rules ORDER BY id DESC")
     rules = [dict(r) for r in cur.fetchall()]
@@ -227,7 +360,7 @@ def create_custom_rule(rule: CustomRuleCreate, admin: str = Depends(verify_admin
     if not is_valid:
         raise HTTPException(status_code=400, detail=f"Invalid domain syntax: {err}")
 
-    conn = get_db(GatewayConfig.DB_PATH)
+    conn = get_db(get_active_db_path())
     cur = conn.cursor()
     now = time.time()
     try:
@@ -245,12 +378,12 @@ def create_custom_rule(rule: CustomRuleCreate, admin: str = Depends(verify_admin
     # Invalidate cache and reload policy engine immediately without restart
     policy_engine.cache.invalidate_domain(norm)
     policy_engine.reload_policies()
-    record_audit(admin, "CREATE_CUSTOM_RULE", "RULE", str(rule_id), {"domain": norm, "reason": rule.reason}, GatewayConfig.DB_PATH)
+    record_audit(admin, "CREATE_CUSTOM_RULE", "RULE", str(rule_id), {"domain": norm, "reason": rule.reason}, get_active_db_path())
     return {"status": "SUCCESS", "id": rule_id, "domain": norm}
 
 @app.delete("/api/rules/custom/{rule_id}")
 def delete_custom_rule(rule_id: int, admin: str = Depends(verify_admin_key)):
-    conn = get_db(GatewayConfig.DB_PATH)
+    conn = get_db(get_active_db_path())
     cur = conn.cursor()
     cur.execute("DELETE FROM custom_rules WHERE id = ?", (rule_id,))
     if cur.rowcount == 0:
@@ -260,12 +393,12 @@ def delete_custom_rule(rule_id: int, admin: str = Depends(verify_admin_key)):
     conn.close()
 
     policy_engine.reload_policies()
-    record_audit(admin, "DELETE_CUSTOM_RULE", "RULE", str(rule_id), {}, GatewayConfig.DB_PATH)
+    record_audit(admin, "DELETE_CUSTOM_RULE", "RULE", str(rule_id), {}, get_active_db_path())
     return {"status": "SUCCESS", "deleted_id": rule_id}
 
 @app.put("/api/rules/custom/{rule_id}/toggle")
 def toggle_custom_rule(rule_id: int, admin: str = Depends(verify_admin_key)):
-    conn = get_db(GatewayConfig.DB_PATH)
+    conn = get_db(get_active_db_path())
     cur = conn.cursor()
     cur.execute("UPDATE custom_rules SET enabled = 1 - enabled, updated_at = ? WHERE id = ?", (time.time(), rule_id))
     if cur.rowcount == 0:
@@ -275,13 +408,13 @@ def toggle_custom_rule(rule_id: int, admin: str = Depends(verify_admin_key)):
     conn.close()
 
     policy_engine.reload_policies()
-    record_audit(admin, "TOGGLE_CUSTOM_RULE", "RULE", str(rule_id), {}, GatewayConfig.DB_PATH)
+    record_audit(admin, "TOGGLE_CUSTOM_RULE", "RULE", str(rule_id), {}, get_active_db_path())
     return {"status": "SUCCESS"}
 
 # --- 2. Allowlist ---
 @app.get("/api/rules/allowlist")
 def list_allowlist(admin: str = Depends(verify_admin_key)):
-    conn = get_db(GatewayConfig.DB_PATH)
+    conn = get_db(get_active_db_path())
     cur = conn.cursor()
     cur.execute("SELECT id, domain, rule_type, enabled, reason, created_at FROM allowlist ORDER BY id DESC")
     rules = [dict(r) for r in cur.fetchall()]
@@ -294,7 +427,7 @@ def create_allowlist_entry(rule: AllowlistCreate, admin: str = Depends(verify_ad
     if not is_valid:
         raise HTTPException(status_code=400, detail=f"Invalid domain syntax: {err}")
 
-    conn = get_db(GatewayConfig.DB_PATH)
+    conn = get_db(get_active_db_path())
     cur = conn.cursor()
     now = time.time()
     try:
@@ -310,12 +443,12 @@ def create_allowlist_entry(rule: AllowlistCreate, admin: str = Depends(verify_ad
     conn.close()
 
     policy_engine.reload_policies()
-    record_audit(admin, "CREATE_ALLOWLIST", "ALLOWLIST", str(rule_id), {"domain": norm, "reason": rule.reason}, GatewayConfig.DB_PATH)
+    record_audit(admin, "CREATE_ALLOWLIST", "ALLOWLIST", str(rule_id), {"domain": norm, "reason": rule.reason}, get_active_db_path())
     return {"status": "SUCCESS", "id": rule_id, "domain": norm}
 
 @app.delete("/api/rules/allowlist/{rule_id}")
 def delete_allowlist_entry(rule_id: int, admin: str = Depends(verify_admin_key)):
-    conn = get_db(GatewayConfig.DB_PATH)
+    conn = get_db(get_active_db_path())
     cur = conn.cursor()
     cur.execute("DELETE FROM allowlist WHERE id = ?", (rule_id,))
     if cur.rowcount == 0:
@@ -325,12 +458,12 @@ def delete_allowlist_entry(rule_id: int, admin: str = Depends(verify_admin_key))
     conn.close()
 
     policy_engine.reload_policies()
-    record_audit(admin, "DELETE_ALLOWLIST", "ALLOWLIST", str(rule_id), {}, GatewayConfig.DB_PATH)
+    record_audit(admin, "DELETE_ALLOWLIST", "ALLOWLIST", str(rule_id), {}, get_active_db_path())
     return {"status": "SUCCESS", "deleted_id": rule_id}
 
 @app.put("/api/rules/allowlist/{rule_id}/toggle")
 def toggle_allowlist_entry(rule_id: int, admin: str = Depends(verify_admin_key)):
-    conn = get_db(GatewayConfig.DB_PATH)
+    conn = get_db(get_active_db_path())
     cur = conn.cursor()
     cur.execute("UPDATE allowlist SET enabled = 1 - enabled WHERE id = ?", (rule_id,))
     if cur.rowcount == 0:
@@ -340,13 +473,13 @@ def toggle_allowlist_entry(rule_id: int, admin: str = Depends(verify_admin_key))
     conn.close()
 
     policy_engine.reload_policies()
-    record_audit(admin, "TOGGLE_ALLOWLIST", "ALLOWLIST", str(rule_id), {}, GatewayConfig.DB_PATH)
+    record_audit(admin, "TOGGLE_ALLOWLIST", "ALLOWLIST", str(rule_id), {}, get_active_db_path())
     return {"status": "SUCCESS"}
 
 # --- 3. Blocked Record Types ---
 @app.get("/api/rules/record-types")
 def list_blocked_record_types(admin: str = Depends(verify_admin_key)):
-    conn = get_db(GatewayConfig.DB_PATH)
+    conn = get_db(get_active_db_path())
     cur = conn.cursor()
     cur.execute("SELECT id, qtype, enabled, reason, created_at FROM blocked_record_types ORDER BY qtype ASC")
     types = [dict(r) for r in cur.fetchall()]
@@ -356,7 +489,7 @@ def list_blocked_record_types(admin: str = Depends(verify_admin_key)):
 @app.post("/api/rules/record-types")
 def create_blocked_record_type(entry: RecordTypeCreate, admin: str = Depends(verify_admin_key)):
     qt = entry.qtype.strip().upper()
-    conn = get_db(GatewayConfig.DB_PATH)
+    conn = get_db(get_active_db_path())
     cur = conn.cursor()
     try:
         cur.execute("""
@@ -371,12 +504,12 @@ def create_blocked_record_type(entry: RecordTypeCreate, admin: str = Depends(ver
     conn.close()
 
     policy_engine.reload_policies()
-    record_audit(admin, "CREATE_RECORD_TYPE_BLOCK", "RECORD_TYPE", str(row_id), {"qtype": qt}, GatewayConfig.DB_PATH)
+    record_audit(admin, "CREATE_RECORD_TYPE_BLOCK", "RECORD_TYPE", str(row_id), {"qtype": qt}, get_active_db_path())
     return {"status": "SUCCESS", "id": row_id, "qtype": qt}
 
 @app.delete("/api/rules/record-types/{entry_id}")
 def delete_blocked_record_type(entry_id: int, admin: str = Depends(verify_admin_key)):
-    conn = get_db(GatewayConfig.DB_PATH)
+    conn = get_db(get_active_db_path())
     cur = conn.cursor()
     cur.execute("DELETE FROM blocked_record_types WHERE id = ?", (entry_id,))
     if cur.rowcount == 0:
@@ -386,13 +519,13 @@ def delete_blocked_record_type(entry_id: int, admin: str = Depends(verify_admin_
     conn.close()
 
     policy_engine.reload_policies()
-    record_audit(admin, "DELETE_RECORD_TYPE_BLOCK", "RECORD_TYPE", str(entry_id), {}, GatewayConfig.DB_PATH)
+    record_audit(admin, "DELETE_RECORD_TYPE_BLOCK", "RECORD_TYPE", str(entry_id), {}, get_active_db_path())
     return {"status": "SUCCESS", "deleted_id": entry_id}
 
 # --- 4. Blocklist Feeds & Synchronization ---
 @app.get("/api/blocklists")
 def list_blocklists(admin: str = Depends(verify_admin_key)):
-    conn = get_db(GatewayConfig.DB_PATH)
+    conn = get_db(get_active_db_path())
     cur = conn.cursor()
     cur.execute("SELECT id, name, url_or_path, category, enabled, entry_count, last_updated, last_status, last_error FROM blocklist_sources ORDER BY id ASC")
     sources = [dict(r) for r in cur.fetchall()]
@@ -401,7 +534,7 @@ def list_blocklists(admin: str = Depends(verify_admin_key)):
 
 @app.post("/api/blocklists")
 def create_blocklist_source(src: BlocklistSourceCreate, admin: str = Depends(verify_admin_key)):
-    conn = get_db(GatewayConfig.DB_PATH)
+    conn = get_db(get_active_db_path())
     cur = conn.cursor()
     try:
         cur.execute("""
@@ -416,17 +549,17 @@ def create_blocklist_source(src: BlocklistSourceCreate, admin: str = Depends(ver
     conn.close()
 
     # Automatically trigger initial sync for this source
-    policy_engine.blocklist_manager.sync_source(source_id, GatewayConfig.DB_PATH)
+    policy_engine.blocklist_manager.sync_source(source_id, get_active_db_path())
     policy_engine.reload_policies()
-    record_audit(admin, "CREATE_BLOCKLIST_SOURCE", "BLOCKLIST", str(source_id), {"name": src.name}, GatewayConfig.DB_PATH)
+    record_audit(admin, "CREATE_BLOCKLIST_SOURCE", "BLOCKLIST", str(source_id), {"name": src.name}, get_active_db_path())
     return {"status": "SUCCESS", "id": source_id}
 
 @app.post("/api/blocklists/{source_id}/sync")
 def sync_blocklist_source(source_id: int, admin: str = Depends(verify_admin_key)):
     """Triggers atomic update and validation of a specific blocklist source."""
-    success, msg = policy_engine.blocklist_manager.sync_source(source_id, GatewayConfig.DB_PATH)
+    success, msg = policy_engine.blocklist_manager.sync_source(source_id, get_active_db_path())
     policy_engine.reload_policies()
-    record_audit(admin, "SYNC_BLOCKLIST_SOURCE", "BLOCKLIST", str(source_id), {"success": success, "message": msg}, GatewayConfig.DB_PATH)
+    record_audit(admin, "SYNC_BLOCKLIST_SOURCE", "BLOCKLIST", str(source_id), {"success": success, "message": msg}, get_active_db_path())
     if not success:
         return JSONResponse(status_code=400, content={"status": "FAILED", "detail": msg})
     return {"status": "SUCCESS", "message": msg}
@@ -434,14 +567,14 @@ def sync_blocklist_source(source_id: int, admin: str = Depends(verify_admin_key)
 @app.post("/api/blocklists/sync-all")
 def sync_all_blocklists(admin: str = Depends(verify_admin_key)):
     """Triggers atomic synchronization across all enabled blocklist sources."""
-    results = policy_engine.blocklist_manager.sync_all_sources(GatewayConfig.DB_PATH)
+    results = policy_engine.blocklist_manager.sync_all_sources(get_active_db_path())
     policy_engine.reload_policies()
-    record_audit(admin, "SYNC_ALL_BLOCKLISTS", "BLOCKLIST", None, results, GatewayConfig.DB_PATH)
+    record_audit(admin, "SYNC_ALL_BLOCKLISTS", "BLOCKLIST", None, results, get_active_db_path())
     return {"status": "SUCCESS", "results": results}
 
 @app.delete("/api/blocklists/{source_id}")
 def delete_blocklist_source(source_id: int, admin: str = Depends(verify_admin_key)):
-    conn = get_db(GatewayConfig.DB_PATH)
+    conn = get_db(get_active_db_path())
     cur = conn.cursor()
     cur.execute("DELETE FROM blocklist_sources WHERE id = ?", (source_id,))
     if cur.rowcount == 0:
@@ -450,15 +583,15 @@ def delete_blocklist_source(source_id: int, admin: str = Depends(verify_admin_ke
     conn.commit()
     conn.close()
 
-    policy_engine.blocklist_manager.load_from_db(GatewayConfig.DB_PATH)
+    policy_engine.blocklist_manager.load_from_db(get_active_db_path())
     policy_engine.reload_policies()
-    record_audit(admin, "DELETE_BLOCKLIST_SOURCE", "BLOCKLIST", str(source_id), {}, GatewayConfig.DB_PATH)
+    record_audit(admin, "DELETE_BLOCKLIST_SOURCE", "BLOCKLIST", str(source_id), {}, get_active_db_path())
     return {"status": "SUCCESS", "deleted_id": source_id}
 
 # --- 5. Upstream Resolvers ---
 @app.get("/api/upstreams")
 def list_upstreams(admin: str = Depends(verify_admin_key)):
-    conn = get_db(GatewayConfig.DB_PATH)
+    conn = get_db(get_active_db_path())
     cur = conn.cursor()
     cur.execute("SELECT id, address, port, protocol, priority, enabled, health_status, last_latency_ms, last_checked FROM upstream_resolvers ORDER BY priority ASC")
     upstreams = [dict(r) for r in cur.fetchall()]
@@ -467,7 +600,7 @@ def list_upstreams(admin: str = Depends(verify_admin_key)):
 
 @app.post("/api/upstreams")
 def create_upstream(up: UpstreamCreate, admin: str = Depends(verify_admin_key)):
-    conn = get_db(GatewayConfig.DB_PATH)
+    conn = get_db(get_active_db_path())
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO upstream_resolvers (address, port, protocol, priority, enabled, health_status)
@@ -478,7 +611,7 @@ def create_upstream(up: UpstreamCreate, admin: str = Depends(verify_admin_key)):
     conn.close()
 
     policy_engine.reload_policies()
-    record_audit(admin, "CREATE_UPSTREAM", "UPSTREAM", str(row_id), {"address": up.address, "port": up.port}, GatewayConfig.DB_PATH)
+    record_audit(admin, "CREATE_UPSTREAM", "UPSTREAM", str(row_id), {"address": up.address, "port": up.port}, get_active_db_path())
     return {"status": "SUCCESS", "id": row_id}
 
 @app.post("/api/upstreams/test")
@@ -489,7 +622,7 @@ def test_upstream_endpoint(req: UpstreamTestRequest, admin: str = Depends(verify
 
 @app.delete("/api/upstreams/{upstream_id}")
 def delete_upstream(upstream_id: int, admin: str = Depends(verify_admin_key)):
-    conn = get_db(GatewayConfig.DB_PATH)
+    conn = get_db(get_active_db_path())
     cur = conn.cursor()
     cur.execute("DELETE FROM upstream_resolvers WHERE id = ?", (upstream_id,))
     if cur.rowcount == 0:
@@ -499,13 +632,13 @@ def delete_upstream(upstream_id: int, admin: str = Depends(verify_admin_key)):
     conn.close()
 
     policy_engine.reload_policies()
-    record_audit(admin, "DELETE_UPSTREAM", "UPSTREAM", str(upstream_id), {}, GatewayConfig.DB_PATH)
+    record_audit(admin, "DELETE_UPSTREAM", "UPSTREAM", str(upstream_id), {}, get_active_db_path())
     return {"status": "SUCCESS", "deleted_id": upstream_id}
 
 # --- 6. Settings & Audit Trail ---
 @app.get("/api/settings")
 def get_settings(admin: str = Depends(verify_admin_key)):
-    conn = get_db(GatewayConfig.DB_PATH)
+    conn = get_db(get_active_db_path())
     cur = conn.cursor()
     cur.execute("SELECT key, value FROM gateway_settings")
     settings = {r["key"]: r["value"] for r in cur.fetchall()}
@@ -514,7 +647,7 @@ def get_settings(admin: str = Depends(verify_admin_key)):
 
 @app.put("/api/settings")
 def update_settings(body: SettingsUpdateRequest, admin: str = Depends(verify_admin_key)):
-    conn = get_db(GatewayConfig.DB_PATH)
+    conn = get_db(get_active_db_path())
     cur = conn.cursor()
     updates = {}
     if body.blocked_response_rcode:
@@ -536,20 +669,20 @@ def update_settings(body: SettingsUpdateRequest, admin: str = Depends(verify_adm
     conn.close()
 
     policy_engine.reload_policies()
-    record_audit(admin, "UPDATE_SETTINGS", "SETTINGS", None, updates, GatewayConfig.DB_PATH)
+    record_audit(admin, "UPDATE_SETTINGS", "SETTINGS", None, updates, get_active_db_path())
     return {"status": "SUCCESS", "updated": updates}
 
 @app.get("/api/audit")
 def list_audit_logs(limit: int = Query(100, ge=1, le=500), admin: str = Depends(verify_admin_key)):
     """Returns administrative action audit history."""
-    return get_audit_logs(limit=limit, db_path=GatewayConfig.DB_PATH)
+    return get_audit_logs(limit=limit, db_path=get_active_db_path())
 
 @app.post("/api/dns/logs/prune")
 def prune_logs_endpoint(body: PruneLogsRequest, admin: str = Depends(verify_admin_key)):
     """Prunes DNS query logs older than specified retention days."""
     days = body.retention_days or GatewayConfig.LOG_RETENTION_DAYS
-    deleted = prune_old_logs(days, GatewayConfig.DB_PATH)
-    record_audit(admin, "PRUNE_LOGS", "SYSTEM", None, {"days": days, "deleted_rows": deleted}, GatewayConfig.DB_PATH)
+    deleted = prune_old_logs(days, get_active_db_path())
+    record_audit(admin, "PRUNE_LOGS", "SYSTEM", None, {"days": days, "deleted_rows": deleted}, get_active_db_path())
     return {"status": "SUCCESS", "deleted_rows": deleted, "retention_days": days}
 
 # Offline Forensics / PCAP analysis (Preserved without risk scoring)

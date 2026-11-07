@@ -1,0 +1,129 @@
+============================= test session starts =============================
+platform win32 -- Python 3.12.10, pytest-9.1.1, pluggy-1.6.0 -- C:\project\dns tunneling\.venv\Scripts\python.exe
+cachedir: .pytest_cache
+rootdir: C:\project\dns tunneling
+plugins: anyio-4.15.1
+collecting ... collected 95 items
+
+tests/test_api.py::test_api_status PASSED                                [  1%]
+tests/test_api.py::test_api_dns_statistics PASSED                        [  2%]
+tests/test_api.py::test_api_auth_login PASSED                            [  3%]
+tests/test_api.py::test_api_dns_logs_and_latest PASSED                   [  4%]
+tests/test_api.py::test_api_custom_rules_crud PASSED                     [  5%]
+tests/test_api.py::test_api_allowlist_crud PASSED                        [  6%]
+tests/test_api.py::test_api_blocklist_sources_and_sync PASSED            [  7%]
+tests/test_api.py::test_api_settings_and_audit PASSED                    [  8%]
+tests/test_detection.py::test_entropy_detector PASSED                    [  9%]
+tests/test_detection.py::test_rule_detector PASSED                       [ 10%]
+tests/test_detection.py::test_behavioral_detector PASSED                 [ 11%]
+tests/test_detection.py::test_risk_engine_fusion PASSED                  [ 12%]
+tests/test_detection_exceptions.py::test_customer_controllable_cloud_domains_not_exempted_from_tunneling PASSED [ 13%]
+tests/test_detection_exceptions.py::test_txt_records_on_cdn_infrastructure_are_not_exempted PASSED [ 14%]
+tests/test_detection_exceptions.py::test_high_volume_bursts_on_cdn_domains_are_not_exempted PASSED [ 15%]
+tests/test_detection_exceptions.py::test_narrow_infrastructure_exemption_scoped_to_address_queries PASSED [ 16%]
+tests/test_encoder_decoder.py::test_encoding_decoding_base32 PASSED      [ 17%]
+tests/test_encoder_decoder.py::test_encoding_decoding_base64 PASSED      [ 18%]
+tests/test_encoder_decoder.py::test_encoding_decoding_hex PASSED         [ 20%]
+tests/test_encoder_decoder.py::test_lab_dns_server_and_client PASSED     [ 21%]
+tests/test_features.py::test_shannon_entropy_calculation PASSED          [ 22%]
+tests/test_features.py::test_feature_extractor_ratios PASSED             [ 23%]
+tests/test_features.py::test_scapy_packet_parsing PASSED                 [ 24%]
+tests/test_gateway.py::test_udp_dns_request PASSED                       [ 25%]
+tests/test_gateway.py::test_tcp_dns_request PASSED                       [ 26%]
+tests/test_gateway.py::test_blocked_request_never_reaches_upstream PASSED [ 27%]
+tests/test_gateway.py::test_domain_boundary_matching PASSED              [ 28%]
+tests/test_gateway.py::test_rule_precedence PASSED                       [ 29%]
+tests/test_gateway.py::test_cached_domain_blocking_after_rule_updates PASSED [ 30%]
+tests/test_gateway.py::test_malformed_requests PASSED                    [ 31%]
+tests/test_gateway.py::test_upstream_failure_servfail PASSED             [ 32%]
+tests/test_gateway.py::test_atomic_blocklist_update_and_failsafe PASSED  [ 33%]
+tests/test_gateway.py::test_rate_limiting PASSED                         [ 34%]
+tests/test_gateway.py::test_record_type_blocking PASSED                  [ 35%]
+tests/test_gateway.py::test_access_control PASSED                        [ 36%]
+tests/test_gateway_hardening.py::test_tcp_fragmented_prefix_and_payload_are_reassembled PASSED [ 37%]
+tests/test_gateway_hardening.py::test_worker_pool_is_bounded PASSED      [ 38%]
+tests/test_gateway_hardening.py::test_partial_startup_closes_first_listener PASSED [ 40%]
+tests/test_gateway_hardening.py::test_shutdown_releases_udp_and_tcp_ports PASSED [ 41%]
+tests/test_gateway_hardening.py::test_normalize_domain_allows_valid_underscores_and_rejects_malformed PASSED [ 42%]
+tests/test_gateway_hardening.py::test_upstream_validates_transaction_id_and_question PASSED [ 43%]
+tests/test_hosted_management.py::test_tenant_creation_and_policy_initialization PASSED [ 44%]
+tests/test_hosted_management.py::test_signed_policy_distribution_and_client_verification PASSED [ 45%]
+tests/test_hosted_management.py::test_websocket_single_use_ticket_flow PASSED [ 46%]
+tests/test_hosted_management.py::test_enrollment_token_single_use_and_revocation PASSED [ 47%]
+tests/test_hosted_management.py::test_enrollment_token_expiry PASSED     [ 48%]
+tests/test_hosted_management.py::test_cross_tenant_access_denial PASSED  [ 49%]
+tests/test_hosted_management.py::test_telemetry_toggle_settings PASSED   [ 50%]
+tests/test_installer_quoting.py::test_scm_image_path_quoting PASSED      [ 51%]
+tests/test_installer_quoting.py::test_installer_iss_script_contains_quoted_scm_commands PASSED [ 52%]
+tests/test_ipc_security.py::test_unelevated_ordinary_user_can_read_status_and_events PASSED [ 53%]
+tests/test_ipc_security.py::test_unelevated_user_cannot_execute_privileged_mutations PASSED [ 54%]
+tests/test_ipc_security.py::test_privileged_mutation_with_invalid_token_is_rejected PASSED [ 55%]
+tests/test_ipc_security.py::test_authorized_privileged_mutation_succeeds PASSED [ 56%]
+tests/test_ipc_security.py::test_replay_attack_is_strictly_detected_and_prevented PASSED [ 57%]
+tests/test_ipc_security.py::test_expired_timestamp_is_rejected PASSED    [ 58%]
+tests/test_ipc_security.py::test_future_skewed_timestamp_is_rejected PASSED [ 60%]
+tests/test_ipc_security.py::test_message_size_limit_enforced PASSED      [ 61%]
+tests/test_ipc_security.py::test_unknown_operation_rejected PASSED       [ 62%]
+tests/test_network_and_firewall.py::test_firewall_preview_rules_generates_matching_rollback PASSED [ 63%]
+tests/test_network_and_firewall.py::test_network_manager_dry_run_does_not_mutate_system PASSED [ 64%]
+tests/test_network_and_firewall.py::test_network_manager_snapshot_persistence_and_restore PASSED [ 65%]
+tests/test_network_and_firewall.py::test_service_runtime_diagnostics_redacts_secrets PASSED [ 66%]
+tests/test_network_and_firewall.py::test_restore_preserves_admin_changes PASSED [ 67%]
+tests/test_network_and_firewall.py::test_degraded_status_reported_when_listener_dead PASSED [ 68%]
+tests/test_network_and_firewall.py::test_restore_preserves_static_dns_servers PASSED [ 69%]
+tests/test_pcap.py::test_generate_and_analyze_pcap PASSED                [ 70%]
+tests/test_pcap.py::test_evidence_exporter PASSED                        [ 71%]
+tests/test_policy_authentication.py::test_asymmetric_keypair_generation PASSED [ 72%]
+tests/test_policy_authentication.py::test_asymmetric_signing_and_verification PASSED [ 73%]
+tests/test_policy_authentication.py::test_idempotent_equal_version_handling PASSED [ 74%]
+tests/test_policy_authentication.py::test_rollback_protection PASSED     [ 75%]
+tests/test_policy_authentication.py::test_persisted_state_survives_restart PASSED [ 76%]
+tests/test_policy_authentication.py::test_key_rotation_with_keyring PASSED [ 77%]
+tests/test_policy_authentication.py::test_service_runtime_apply_policy PASSED [ 78%]
+tests/test_service_foundation.py::test_health_does_not_equate_running_with_protected PASSED [ 80%]
+tests/test_service_foundation.py::test_ipc_rejects_unauthorized_and_unknown_operations PASSED [ 81%]
+tests/test_service_foundation.py::test_service_runtime_stop_is_safe PASSED [ 82%]
+tests/test_service_foundation.py::test_health_degraded_when_routing_verified_but_listener_down PASSED [ 83%]
+tests/test_service_foundation.py::test_handle_cli_command_reads_secret_internally PASSED [ 84%]
+tests/test_standalone_recovery.py::test_recovery_script_exists_and_is_found PASSED [ 85%]
+tests/test_standalone_recovery.py::test_standalone_recovery_executes_without_service_running PASSED [ 86%]
+tests/test_standalone_recovery.py::test_standalone_recovery_preserves_static_servers_without_dhcp_fallback PASSED [ 87%]
+tests/test_tunneling.py::test_shannon_entropy_calculation PASSED         [ 88%]
+tests/test_tunneling.py::test_cdn_and_cloud_allowlist_prevents_false_positives PASSED [ 89%]
+tests/test_tunneling.py::test_standard_domains_not_flagged PASSED        [ 90%]
+tests/test_tunneling.py::test_high_entropy_long_payload_txt_flagged_as_suspected PASSED [ 91%]
+tests/test_tunneling.py::test_burst_high_entropy_queries_flagged PASSED  [ 92%]
+tests/test_wfp_manager.py::test_wfp_filter_specifications_and_weights PASSED [ 93%]
+tests/test_wfp_manager.py::test_wfp_weight_fwp_uint64_and_flags PASSED   [ 94%]
+tests/test_wfp_manager.py::test_wfp_preview_and_non_claims PASSED        [ 95%]
+tests/test_wfp_manager.py::test_wfp_dry_run_safety PASSED                [ 96%]
+tests/test_wfp_manager.py::test_wfp_ctypes_structures_and_guid_alignment PASSED [ 97%]
+tests/test_wfp_manager.py::test_wfp_dll_bindings PASSED                  [ 98%]
+tests/test_wfp_manager.py::test_wfp_delete_methods PASSED                [100%]
+
+============================== warnings summary ===============================
+.venv\Lib\site-packages\fastapi\testclient.py:1
+  C:\project\dns tunneling\.venv\Lib\site-packages\fastapi\testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+tests/test_detection.py::test_risk_engine_fusion
+tests/test_pcap.py::test_generate_and_analyze_pcap
+  C:\project\dns tunneling\.venv\Lib\site-packages\sklearn\base.py:525: InconsistentVersionWarning: Trying to unpickle estimator ExtraTreeRegressor from version 1.5.0 when using version 1.9.1. This might lead to breaking code or invalid results. Use at your own risk. For more info please refer to:
+  https://scikit-learn.org/stable/model_persistence.html#security-maintainability-limitations
+    warnings.warn(
+
+tests/test_detection.py::test_risk_engine_fusion
+tests/test_pcap.py::test_generate_and_analyze_pcap
+  C:\project\dns tunneling\.venv\Lib\site-packages\sklearn\base.py:525: InconsistentVersionWarning: Trying to unpickle estimator IsolationForest from version 1.5.0 when using version 1.9.1. This might lead to breaking code or invalid results. Use at your own risk. For more info please refer to:
+  https://scikit-learn.org/stable/model_persistence.html#security-maintainability-limitations
+    warnings.warn(
+
+tests/test_features.py: 2 warnings
+tests/test_pcap.py: 10 warnings
+  C:\project\dns tunneling\.venv\Lib\site-packages\scapy\layers\dns.py:1283: DeprecationWarning: The DNS fields 'qd', 'an', 'ns' and 'ar' are now PacketListField(s) ! To access the first element, use pkt.an[0] instead of pkt.an
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+---- generated xml file: C:\project\dns tunneling\dist\pytest_results.xml -----
+====================== 95 passed, 17 warnings in 11.20s =======================
+

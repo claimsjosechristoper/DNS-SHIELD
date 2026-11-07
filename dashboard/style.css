@@ -136,6 +136,27 @@ header {
     100% { transform: scale(0.95); opacity: 0.8; }
 }
 
+.pulse-dot.pulse-amber {
+    background-color: #f59e0b;
+    box-shadow: 0 0 10px #f59e0b;
+}
+
+.pulse-dot.pulse-red {
+    background-color: var(--decision-block);
+    box-shadow: 0 0 10px var(--decision-block);
+}
+
+.status-badge.status-offline {
+    background: var(--decision-block-bg);
+    color: var(--decision-block);
+    border-color: var(--decision-block-border);
+}
+
+.status-badge.status-offline .pulse-dot {
+    background-color: var(--decision-block);
+    box-shadow: 0 0 10px var(--decision-block);
+}
+
 /* Tab Navigation */
 .tabs {
     display: flex;
@@ -239,7 +260,18 @@ header {
     border: 1px solid var(--border-color);
     border-radius: 0.75rem;
     padding: 1.25rem;
-    min-height: 260px;
+    min-width: 0;
+}
+
+.chart-viewport {
+    position: relative;
+    height: 280px;
+    width: 100%;
+    min-width: 0;
+}
+
+.chart-viewport canvas {
+    display: block;
 }
 
 .chart-header {

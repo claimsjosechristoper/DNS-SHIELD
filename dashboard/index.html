@@ -4,8 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>DNS Security Gateway | Deterministic Threat Enforcement</title>
-    <link rel="stylesheet" href="style.css">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="style.css?v=2">
 </head>
 <body>
     <header>
@@ -111,13 +110,17 @@
                     <div class="chart-title">Real-Time Traffic Decisions (ALLOW vs BLOCK)</div>
                     <span class="badge-type">Streaming</span>
                 </div>
-                <canvas id="chart-traffic" height="110"></canvas>
+                <div class="chart-viewport">
+                    <canvas id="chart-traffic"></canvas>
+                </div>
             </div>
             <div class="chart-card">
                 <div class="chart-header">
                     <div class="chart-title">Enforcement Decision Breakdown</div>
                 </div>
-                <canvas id="chart-decisions" height="110"></canvas>
+                <div class="chart-viewport">
+                    <canvas id="chart-decisions"></canvas>
+                </div>
             </div>
         </div>
 
@@ -149,9 +152,9 @@
                 <div class="panel-header">
                     <div class="panel-title">
                         <span>Live Gateway Query Stream</span>
-                        <div class="pulse-dot"></div>
+                        <div class="pulse-dot" id="ws-pulse-dot"></div>
                     </div>
-                    <span style="font-size: 0.75rem; color: var(--text-muted);">WebSocket Connected</span>
+                    <span style="font-size: 0.75rem; color: var(--text-muted);" id="ws-status-text">Connecting...</span>
                 </div>
                 <div class="table-container" style="max-height: 380px; overflow-y: auto;">
                     <table>
@@ -649,6 +652,6 @@
         </div>
     </div>
 
-    <script src="app.js"></script>
+    <script src="app.js?v=2"></script>
 </body>
 </html>
